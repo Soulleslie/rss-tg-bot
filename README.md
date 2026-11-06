@@ -2,7 +2,7 @@
 
 多用户 RSS 关键词提醒机器人。所有可删除的运行内容都集中在 `/opt/rss-tg-bot`；不开放入站端口，Telegram 通过 long polling 连接。
 
-完整的中文命令说明、示例与排错指南见 [使用手册](docs/USAGE.zh-CN.md)。
+完整的中文命令说明、每条命令的可复制示例、版块选择方法与排错指南见 [完整使用手册](docs/USAGE.zh-CN.md)。
 
 ## 功能
 
@@ -51,11 +51,11 @@ sudo bash /opt/rss-tg-bot/scripts/uninstall.sh
 
 脚本要求输入 `DELETE`，随后停止并删除服务、项目、Token 配置和 SQLite 数据库；它不会删除系统 Python 或 `python3-venv`。
 
-## Telegram 命令
+## Telegram 命令速查
 
-1. **订阅源**：`/feeds`、`/subscribe <源ID>`、`/unsubscribe <源ID>`、`/mysources`
-2. **推送方式**：`/all` 查看模式；`/all <源ID> <on|off>` 设置全量或关键词推送。
-3. **关键词与过滤**：`/keywords [词1,词2]`、`/combo <词1,词2>`、`/on <ID>`、`/off <ID>`、`/delkw <ID>`、`/block <词1,词2>`、`/blocks`、`/delblock <ID>`、`/sections <源ID> [版块ID1,版块ID2]`、`/clearsections <源ID>`。
-4. **推送目标**：`/addtarget [chat_id]`、`/targets`、`/deltarget <ID>`。
-5. **查询与控制**：`/status`、`/history [数量]`、`/pause`、`/resume`、`/whoami`。
-6. **管理员**：`/addfeed <RSS地址>`、`/delfeed <源ID>`、`/feedstatus`。
+先在私聊中执行：`/start` → `/feeds` → `/subscribe 1`。然后二选一：
+
+- 全量推送：`/all 1 on`
+- 关键词推送：`/keywords OpenAI,AI`（如曾开启全量，执行 `/all 1 off`）
+
+在 Telegram 内发送 `/help` 可看到同样的快速说明和示例。完整的每条命令参数、ID 的区别、群组/频道绑定、版块选择与排错，请看 [完整使用手册](docs/USAGE.zh-CN.md)。

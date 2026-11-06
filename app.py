@@ -22,6 +22,18 @@ TOKEN = os.getenv("TG_BOT_TOKEN", "")
 POLL_INTERVAL = max(10, int(os.getenv("POLL_INTERVAL_SECONDS", "10")))
 MAX_TARGETS = max(1, int(os.getenv("MAX_TARGETS_PER_USER", "10")))
 
+# RSS feeds commonly expose their category identifiers in English.  Keep the
+# original tag visible while making the most common labels easier to read.
+SECTION_LABELS = {
+    "carpool": "拼车",
+    "daily": "日常",
+    "info": "情报",
+    "promotion": "推广",
+    "review": "评测",
+    "tech": "技术",
+    "trade": "交易",
+}
+
 
 def parse_ids(name: str) -> set[int]:
     return {int(value) for value in os.getenv(name, "").split(",") if value.strip().isdigit()}
@@ -46,6 +58,11 @@ def clean_text(value: str) -> str:
 
 def comma_values(value: str) -> list[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def display_section_name(name: str) -> str:
+    translated = SECTION_LABELS.get(name.casefold())
+    return f"{translated}（{name}）" if translated else name
 
 
 class Store:
@@ -163,35 +180,39 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     await respond(
         update,
-        """常用命令（按使用顺序）：
+        """使用说明：<必填> 必须替换；[可选] 可省略；多个词/ID 用英文逗号 , 分隔。
 
-① RSS 源与订阅
-/feeds — 查看可用 RSS 源
-/subscribe <源ID> — 订阅
-/unsubscribe <源ID> — 取消订阅
+① 先订阅一个 RSS
+/feeds — 查看“源 ID”
+/subscribe <源ID>，例：/subscribe 1
 /mysources — 查看我的订阅
+/unsubscribe <源ID> — 取消订阅
 
-② 推送方式
-/all — 查看各源模式
-/all <源ID> <on|off> — 开启/关闭该源全量推送
+② 每个源选择一种推送方式
+/all — 查看模式
+/all <源ID> on — 全量推送，例：/all 1 on
+/all <源ID> off — 关键词推送，例：/all 1 off
 
-③ 关键词与过滤
-/keywords [词1,词2] — 查看/添加普通关键词
-/combo 词1,词2 — 添加组合关键词（全部命中）
-/on <ID> /off <ID> /delkw <ID> — 管理关键词
-/block 词1,词2 /blocks /delblock <ID> — 管理屏蔽词
-/sections <源ID> [版块ID1,版块ID2] — 选择版块
-/clearsections <源ID> — 恢复全部版块
+③ 关键词、屏蔽词、版块（均为可选筛选）
+/keywords — 查看关键词和“关键词 ID”
+/keywords 词1,词2 — 任一词命中，例：/keywords OpenAI,AI
+/combo 词1,词2 — 所有词同时命中
+/on <关键词ID>、/off <关键词ID>、/delkw <关键词ID>
+/block 词1,词2 — 命中即不推送
+/blocks、/delblock <屏蔽词ID>
+/sections <源ID> — 先查看版块 ID
+/sections <源ID> <版块ID1,版块ID2> — 选择版块，例：/sections 1 1,142
+/clearsections <源ID> — 恢复该源所有版块
 
-④ 推送目标
-/addtarget [chat_id] /targets /deltarget <ID>
+④ 推送到哪里
+私聊：/start 自动添加；群内：/addtarget；频道：私聊 /addtarget <chat_id>
+/targets、/deltarget <目标ID>
 
-⑤ 查询与控制
-/status /history [数量]
-/pause /resume /whoami
+⑤ 状态与控制
+/status、/history [数量]、/pause、/resume、/whoami
 
-⑥ 管理员命令
-/addfeed <RSS地址> /delfeed <源ID> /feedstatus""",
+⑥ 管理员
+/addfeed <RSS地址>、/delfeed <源ID>、/feedstatus""",
     )
 
 
@@ -237,8 +258,8 @@ async def delfeed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id not in ADMIN_USER_IDS or not context.args:
         await respond(update, "用法（管理员）：/delfeed <源ID>")
         return
-    if len(context.args) != 2:
-        await respond(update, "用法：/all <源ID> <on|off>。不带参数可查看模式。")
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await respond(update, "用法（管理员）：/delfeed <源ID>")
         return
     feed_id = context.args[0]
     store.execute("DELETE FROM subscriptions WHERE feed_id=?", (feed_id,))
@@ -299,6 +320,9 @@ async def all_posts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         ).fetchall()
         body = "\n".join(f"{r['id']}. {r['title']} {'✅ 全量推送' if r['active'] else '关键词推送'}" for r in rows)
         await respond(update, "推送模式：\n" + (body or "暂无订阅。"))
+        return
+    if len(context.args) != 2:
+        await respond(update, "用法：/all <源ID> <on|off>。不带参数可查看模式。")
         return
     feed_id = context.args[0]
     subscribed = feed_id.isdigit() and store.execute("SELECT 1 FROM subscriptions WHERE user_id=? AND feed_id=?", (user_id, feed_id)).fetchone()
@@ -418,10 +442,10 @@ async def sections(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await respond(update, "版块选择已更新。")
         return
     rows = store.execute(
-        "SELECT s.id,s.name,ss.section_id IS NOT NULL chosen FROM sections s LEFT JOIN selected_sections ss ON ss.section_id=s.id AND ss.user_id=? WHERE s.feed_id=? ORDER BY s.name",
+        "SELECT s.id,s.name,ss.section_id IS NOT NULL chosen FROM sections s LEFT JOIN selected_sections ss ON ss.section_id=s.id AND ss.user_id=? WHERE s.feed_id=? ORDER BY s.id",
         (user_id, feed_id),
     ).fetchall()
-    body = "\n".join(f"{r['id']}. {r['name']} {'✅' if r['chosen'] else ''}" for r in rows)
+    body = "\n".join(f"{r['id']}. {display_section_name(r['name'])} {'✅' if r['chosen'] else ''}" for r in rows)
     await respond(update, "版块（未选择任何版块表示全部）：\n" + (body or "此源尚未发现版块。"))
 
 
