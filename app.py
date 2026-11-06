@@ -315,7 +315,7 @@ HELP_HOME = f"""📖 <b>使用说明</b>
 1. 发送 /feeds，查看有哪些 RSS 源。每行开头的数字是“源ID”
 2. 订阅：{c("/subscribe 1")}（1 换成你要的源ID）
 3. 选择推送方式（二选一）：
-   · 这个源的新文章全部推送：{c("/all 1 on")}
+   · 这个源的新文章全部推送（不看关键词）：{c("/all 1 on")}
    · 只推送包含关键词的文章：{c("/keywords OpenAI,Claude")}
 4. 发送 /status，确认最后一行是“✅ 设置完整”
 
@@ -337,7 +337,7 @@ HELP_TOPICS: dict[str, tuple[str, str]] = {
 {c("/unsubscribe 1")} — 取消订阅 1 号源（同时清除它的推送方式和版块设置）
 
 <b>推送方式</b>（每个源分别设置）
-· 全量推送：这个源的新文章都推送
+· 全量推送：这个源的新文章都推送，<b>不看关键词</b>
 · 关键词推送：只推送包含你的关键词的文章（刚订阅时默认是这种）
 
 /all — 查看每个源当前的推送方式
@@ -346,13 +346,16 @@ HELP_TOPICS: dict[str, tuple[str, str]] = {
 
 <b>注意</b>
 · 只推送订阅之后出现的新文章，不补发旧文章
+· 全量推送的源即使添加了关键词也不起作用；想按关键词筛选，要改回关键词推送
 · 全量推送的文章同样会被屏蔽词和版块筛选过滤""",
     ),
     "kw": (
         "🔍 关键词与屏蔽词",
         f"""🔍 <b>关键词与屏蔽词</b>
 
-关键词和屏蔽词对你订阅的<b>所有源</b>都生效，不能单独给某个源设置。
+· <b>关键词只对“关键词推送”的源生效</b>。全量推送的源不看关键词，新文章都会推送
+· <b>屏蔽词对你订阅的所有源都生效</b>，包括全量推送的源
+· 关键词和屏蔽词都不能单独给某个源设置
 机器人检查文章的标题和摘要：不区分英文大小写，只要包含就算命中。
 
 <b>普通关键词</b>：包含其中任意一个就推送
@@ -435,7 +438,8 @@ RSS 里出现一篇新文章时，<b>同时满足</b>下面所有条件才会推
 满足后，会发到你所有的推送目标。
 
 <b>每个源分别设置</b>：推送方式（/all）、版块筛选
-<b>对所有源统一生效</b>：关键词、屏蔽词、暂停、推送目标
+<b>只对关键词推送的源生效</b>：关键词（全量推送的源不看关键词）
+<b>对所有源统一生效</b>：屏蔽词、暂停、推送目标
 
 <b>几种编号不要混用</b>
 · 源ID：/feeds 查看
@@ -622,11 +626,23 @@ def subscription_rows(user_id: int):
 
 
 def describe_subscription(user_id: int, row) -> str:
-    mode = "全量推送" if row["full_push"] else "关键词推送"
+    mode = "全量推送（不看关键词）" if row["full_push"] else "关键词推送"
     names = selected_section_names(user_id, row["id"])
     sections_text = "全部版块" if not names else "只看 " + "、".join(display_section_name(n) for n in names)
     disabled = "（已被管理员停用）" if not row["enabled"] else ""
     return f"{row['id']}. {e(row['title'])}{disabled} — {mode} · {e(sections_text)}"
+
+
+def full_push_note(user_id: int) -> str:
+    """Explain that keywords are ignored for feeds in full-push mode."""
+    ids = [row["id"] for row in subscription_rows(user_id) if row["full_push"]]
+    if not ids:
+        return ""
+    names = "、".join(f"{feed_id} 号" for feed_id in ids)
+    return (
+        f"\n\n注意：{names}源是全量推送，不看关键词，新文章都会推送。"
+        f"想让关键词对它生效，改回关键词推送：{c(f'/all {ids[0]} off')}"
+    )
 
 
 def feed_label(feed_id: int, title: str | None) -> str:
@@ -895,7 +911,9 @@ async def all_posts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not rows:
             await respond(update, f"你还没有订阅任何源。先发送 /feeds 查看，再用 {c('/subscribe 1')} 订阅。")
             return
-        body = "\n".join(f"{r['id']}. {e(r['title'])} — {'✅ 全量推送' if r['full_push'] else '🔍 关键词推送'}" for r in rows)
+        body = "\n".join(
+            f"{r['id']}. {e(r['title'])} — {'✅ 全量推送（不看关键词）' if r['full_push'] else '🔍 关键词推送'}" for r in rows
+        )
         first = rows[0]["id"]
         await respond(
             update,
@@ -924,7 +942,11 @@ async def all_posts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     store.commit()
     label = feed_label(feed_id, get_feed(feed_id)["title"])
     if active:
-        await respond(update, f"✅ {label}已改为全量推送：新文章都会推送。\n（屏蔽词和版块筛选仍然有效）")
+        await respond(
+            update,
+            f"✅ {label}已改为全量推送：新文章都会推送，<b>不再看关键词</b>。\n"
+            f"（屏蔽词和版块筛选仍然有效。想按关键词筛选，改回：{c(f'/all {feed_id} off')}）",
+        )
         return
     message = f"🔍 {label}已改为关键词推送：只推送包含你关键词的文章。"
     if not active_rule_count(user_id):
@@ -975,7 +997,11 @@ async def keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             parts.append("✅ 已添加关键词（文章包含其中任意一个就推送）：\n" + "\n".join(added))
         if skipped:
             parts.append("这些关键词之前已经有了，没有重复添加：\n" + "\n".join(skipped))
-        message = "\n\n".join(parts) + short_word_warning([v for v in values if v.casefold() not in existing])
+        message = (
+            "\n\n".join(parts)
+            + short_word_warning([v for v in values if v.casefold() not in existing])
+            + full_push_note(user_id)
+        )
         if added and not store.execute("SELECT 1 FROM subscriptions WHERE user_id=?", (user_id,)).fetchone():
             message += f"\n\n提示：你还没有订阅任何源。先发送 /feeds 查看，再用 {c('/subscribe 1')} 订阅。"
         await respond(update, message)
@@ -998,7 +1024,7 @@ async def keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         update,
         f"<b>我的关键词</b>（每行开头的数字是关键词ID）\n对你所有“关键词推送”的源生效。\n\n{body}\n\n"
         f"暂停：{c(f'/kwoff {first}')}　启用：{c(f'/kwon {first}')}　删除：{c(f'/delkw {first}')}\n"
-        "（把数字换成要操作的关键词ID）",
+        "（把数字换成要操作的关键词ID）" + full_push_note(user_id),
     )
 
 
@@ -1025,7 +1051,8 @@ async def combo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     store.commit()
     await respond(
         update,
-        f"✅ 已添加组合关键词 {cursor.lastrowid}：{e(' + '.join(values))}\n文章必须同时包含这些词才会推送。",
+        f"✅ 已添加组合关键词 {cursor.lastrowid}：{e(' + '.join(values))}\n文章必须同时包含这些词才会推送。"
+        + full_push_note(user_id),
     )
 
 
