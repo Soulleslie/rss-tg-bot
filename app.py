@@ -1603,8 +1603,20 @@ async def register_commands(app: Application) -> None:
 
 async def post_init(app: Application) -> None:
     await register_commands(app)
-    app.create_task(poll_loop(app))
+    # Keep our own reference: Application.create_task() is not tracked before
+    # the application is running, so the task would be destroyed on shutdown.
+    app.bot_data["poll_task"] = asyncio.create_task(poll_loop(app))
     log.info("Polling RSS every %s seconds", POLL_INTERVAL)
+
+
+async def post_shutdown(app: Application) -> None:
+    task = app.bot_data.pop("poll_task", None)
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 COMMAND_HANDLERS = {
@@ -1620,7 +1632,7 @@ COMMAND_HANDLERS = {
 
 
 def build_application() -> Application:
-    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    app = Application.builder().token(TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
     for name, handler in COMMAND_HANDLERS.items():
         app.add_handler(CommandHandler(name, handler))
     private = filters.ChatType.PRIVATE
