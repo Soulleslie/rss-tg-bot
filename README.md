@@ -17,24 +17,46 @@
 - 抓取有超时，并使用 ETag/Last-Modified 条件请求；内容没变时不会重复下载
 - 遇到 Telegram 限流会自动等待重试
 
-运行要求：Debian/Ubuntu，Python 3.10 及以上（python-telegram-bot 22.x 的要求；已在 3.10–3.13 上测试）。
+运行要求：Debian / Ubuntu（使用 systemd），Python 3.10 及以上，例如 Ubuntu 22.04+、Debian 12+。
 
-## VPS 安装
+## 一键部署
 
-```bash
-git clone <YOUR_GITHUB_REPO_URL> /opt/rss-tg-bot
-cd /opt/rss-tg-bot
-sudo bash scripts/install.sh
-sudo nano /opt/rss-tg-bot/.env
-```
-
-填写 `TG_BOT_TOKEN` 后，再运行一次安装脚本：
+用 root 登录 VPS，运行：
 
 ```bash
-sudo bash scripts/install.sh
+bash <(curl -fsSL https://raw.githubusercontent.com/Soulleslie/rss-tg-bot/main/scripts/install.sh)
 ```
 
-然后私聊机器人，发送 `/start` 和 `/whoami`。把返回的用户 ID 填进 `.env` 的 `ADMIN_USER_IDS`，再执行 `sudo systemctl restart rss-tg-bot`。建议同时把这个 ID 写进 `ALLOWED_USER_IDS`。
+脚本会依次完成：安装依赖 → 下载代码到 `/opt/rss-tg-bot` → **提示你粘贴 Bot Token 并向 Telegram 验证** → 可选填写管理员用户ID，并选择是否只允许管理员使用 → 安装运行环境并自检 → 启动机器人、设置开机自启。
+
+- 还没有 Token：在 Telegram 里找 @BotFather，发送 `/newbot` 创建机器人。
+- 不知道自己的用户ID：安装时直接回车跳过。装好后私聊机器人发送 `/whoami` 查看，再运行 `rss-tg-bot admin 你的用户ID`。
+- 安装完成后，按提示打开机器人发送 `/start` 即可开始使用。
+- 在已经装好的机器上再次运行这条命令，会自动改为执行更新，不会覆盖 `.env` 和数据库。
+
+不需要交互的场景（比如开机脚本），可以用环境变量传入：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Soulleslie/rss-tg-bot/main/scripts/install.sh | TG_BOT_TOKEN=你的Token ADMIN_USER_IDS=你的用户ID bash
+```
+
+## 管理命令
+
+安装后可以在任何目录使用 `rss-tg-bot` 命令（需要 root）：
+
+| 命令 | 作用 |
+| --- | --- |
+| `rss-tg-bot update` | **一键更新**：备份 → 拉取最新代码 → 安装依赖 → 自检 → 重启。自检失败时不重启，旧版本继续运行 |
+| `rss-tg-bot uninstall` | **一键卸载**：先自动备份，输入 `DELETE` 确认后删除服务、程序目录和管理命令。备份保留在 `/root/rss-tg-bot-backups` |
+| `rss-tg-bot status` | 查看运行状态和当前版本 |
+| `rss-tg-bot logs` | 查看实时日志，按 Ctrl+C 退出 |
+| `rss-tg-bot restart` | 重启机器人 |
+| `rss-tg-bot backup` | 备份 `.env` 和数据库 |
+| `rss-tg-bot config` | 编辑 `.env`，保存退出后自动重启 |
+| `rss-tg-bot admin <用户ID>` | 添加管理员 |
+| `rss-tg-bot allow <用户ID>` | 加入白名单。第一次使用会开启白名单，之后只有名单里的人能用；现有管理员会被自动加入 |
+
+不带参数运行 `rss-tg-bot`，可以查看全部命令。
 
 ## 配置项（`.env`）
 
@@ -50,50 +72,36 @@ sudo bash scripts/install.sh
 | `DELIVERY_RETENTION_DAYS` | 180 | 推送历史保留天数；0 表示永久保留 |
 | `DISPLAY_TIMEZONE` | Asia/Shanghai | `/history`、`/feedstatus` 显示时间用的时区 |
 
-修改 `.env` 后需要执行 `sudo systemctl restart rss-tg-bot` 才会生效。
+修改 `.env` 推荐用 `rss-tg-bot config`，保存后会自动重启。如果直接编辑文件，改完要运行 `rss-tg-bot restart` 才会生效。
 
 ## 更新
 
 ```bash
-sudo bash /opt/rss-tg-bot/scripts/update.sh
+rss-tg-bot update
 ```
 
-脚本会依次执行：
+更新时会自动备份；数据库结构在启动时自动升级，已有的订阅、关键词和历史都会保留。如果服务器上的代码文件被改过，更新会停下来，并列出被改动的文件，不会直接覆盖。
 
-1. 备份 `.env` 和数据库；
-2. `git pull` 拉取最新代码；
-3. 安装依赖；
-4. 用临时数据库运行自检，失败时不重启，旧版本继续运行；
-5. 更新 systemd 服务文件并重启，然后确认服务已正常运行。
+> 从旧版本升级：旧版本还没有 `rss-tg-bot` 命令，需要先运行两次 `sudo bash /opt/rss-tg-bot/scripts/update.sh`。第一次拉取新代码，第二次安装管理命令。之后就可以用 `rss-tg-bot update` 了。
 
-数据库结构会在启动时自动升级，已有的订阅、关键词和历史都会保留。
-
-## 日常维护
+## 备份与恢复
 
 ```bash
-sudo systemctl status rss-tg-bot
-```
-
-```bash
-sudo journalctl -u rss-tg-bot -f
-```
-
-```bash
-sudo bash /opt/rss-tg-bot/scripts/backup.sh
+rss-tg-bot backup
 ```
 
 备份默认保存在 `/root/rss-tg-bot-backups`，只有 root 可读（备份里有 Token），超过 30 天的自动删除。恢复备份时，先停止服务，再解压覆盖：
 
 ```bash
-sudo systemctl stop rss-tg-bot
+systemctl stop rss-tg-bot
 ```
 
 ```bash
-sudo tar -xzf /root/rss-tg-bot-backups/<备份文件名>.tar.gz -C /opt/rss-tg-bot
+tar -xzf /root/rss-tg-bot-backups/<备份文件名>.tar.gz -C /opt/rss-tg-bot
 ```
 
 ```bash
-sudo systemctl start rss-tg-bot
+systemctl start rss-tg-bot
 ```
 
 ## 开发与测试
@@ -104,15 +112,13 @@ python -m unittest discover -s tests -v
 
 测试使用临时数据库和本地 HTTP 服务器，不需要 Token，也不需要联网。
 
-## 完整卸载
-
-可以先备份，再运行：
+## 卸载
 
 ```bash
-sudo bash /opt/rss-tg-bot/scripts/uninstall.sh
+rss-tg-bot uninstall
 ```
 
-脚本要求输入 `DELETE` 确认，随后停止并删除服务、项目目录、Token 配置和 SQLite 数据库。它不会删除系统自带的 Python 和 `python3-venv`。
+卸载前会自动备份 `.env` 和数据库到 `/root/rss-tg-bot-backups`，然后要求输入 `DELETE` 确认，再删除服务、`/opt/rss-tg-bot` 和 `rss-tg-bot` 命令。系统自带的 Python、git 等软件包不会删除。
 
 ## Telegram 命令速查
 

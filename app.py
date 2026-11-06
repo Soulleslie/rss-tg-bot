@@ -464,7 +464,7 @@ RSS 里出现一篇新文章时，<b>同时满足</b>下面所有条件才会推
         "🛠 管理员命令",
         f"""🛠 <b>管理员命令</b>
 
-需要先把管理员的用户ID写进服务器 .env 的 ADMIN_USER_IDS，并重启服务。
+设置管理员：在服务器上运行 <code>rss-tg-bot admin 你的用户ID</code>（用户ID 用 /whoami 查看）。
 
 {c("/addfeed https://example.com/feed.xml")} — 添加 RSS 源（会先试读一次）
 {c("/delfeed 3")} — 删除 3 号源，以及所有人对它的订阅和设置（推送历史保留）

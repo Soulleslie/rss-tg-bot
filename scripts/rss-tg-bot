@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# Management command, installed as /usr/local/bin/rss-tg-bot (a symlink).
+set -euo pipefail
+
+APP_DIR=/opt/rss-tg-bot
+SERVICE=rss-tg-bot.service
+ENV_FILE="$APP_DIR/.env"
+
+info() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
+die() { printf '\033[1;31m[错误]\033[0m %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+RSS 提醒机器人 · 管理命令
+
+用法：rss-tg-bot <命令>
+
+  status              查看运行状态和当前版本
+  logs                查看实时日志（按 Ctrl+C 退出）
+  restart             重启机器人
+  update              一键更新到最新版本（自动备份和自检，失败不会重启）
+  backup              备份配置和数据库到 /root/rss-tg-bot-backups
+  config              编辑配置文件 .env，保存退出后自动重启
+  admin <用户ID>      添加管理员（用户ID：私聊机器人发送 /whoami 查看）
+  allow <用户ID>      把用户加入白名单；开启白名单后只有名单里的人能用
+  uninstall           一键卸载（会先自动备份）
+EOF
+}
+
+get_env() { sed -n "s/^$1=//p" "$ENV_FILE" | tail -n 1; }
+
+set_env() {
+  if grep -q "^$1=" "$ENV_FILE"; then
+    sed -i "s|^$1=.*|$1=$2|" "$ENV_FILE"
+  else
+    printf '%s=%s\n' "$1" "$2" >>"$ENV_FILE"
+  fi
+}
+
+list_add() {  # list_add <KEY> <id>; returns 1 if already present
+  local current
+  current=$(get_env "$1")
+  [[ ",$current," == *",$2,"* ]] && return 1
+  set_env "$1" "${current:+$current,}$2"
+}
+
+restart_and_check() {
+  systemctl restart "$SERVICE"
+  sleep 3
+  if systemctl is-active --quiet "$SERVICE"; then
+    info "机器人已重启，运行正常。"
+  else
+    journalctl -u "$SERVICE" -n 30 --no-pager || true
+    die "机器人没有启动成功，请查看上面的日志。"
+  fi
+}
+
+command=${1:-help}
+case $command in
+  help | -h | --help) usage; exit 0 ;;
+esac
+
+[[ $(id -u) -eq 0 ]] || die "请用 root 运行：sudo rss-tg-bot $*"
+[[ -d "$APP_DIR" ]] || die "没有找到 $APP_DIR，机器人可能还没有安装。"
+
+case $command in
+  status)
+    if systemctl is-active --quiet "$SERVICE"; then state="▶️ 运行中"; else state="⏹ 未运行"; fi
+    echo "状态：$state"
+    echo "版本：$(git -C "$APP_DIR" -c safe.directory="$APP_DIR" log -1 --format='%h %cd %s' --date=format:'%Y-%m-%d %H:%M' 2>/dev/null || echo 未知)"
+    echo "目录：$APP_DIR"
+    echo
+    systemctl --no-pager --full status "$SERVICE" 2>/dev/null | head -n 12 || true
+    ;;
+  logs)
+    exec journalctl -u "$SERVICE" -n 50 -f
+    ;;
+  restart)
+    restart_and_check
+    ;;
+  update)
+    exec bash "$APP_DIR/scripts/update.sh"
+    ;;
+  backup)
+    exec bash "$APP_DIR/scripts/backup.sh" "${@:2}"
+    ;;
+  config)
+    editor=${EDITOR:-}
+    if [[ -z $editor ]]; then
+      for candidate in nano vim vi; do
+        command -v "$candidate" >/dev/null && { editor=$candidate; break; }
+      done
+    fi
+    [[ -n $editor ]] || die "没有找到文本编辑器，请先安装 nano：apt-get install -y nano"
+    before=$(sha256sum "$ENV_FILE")
+    "$editor" "$ENV_FILE"
+    if [[ $(sha256sum "$ENV_FILE") == "$before" ]]; then
+      info "配置没有改动，不需要重启。"
+    else
+      restart_and_check
+    fi
+    ;;
+  admin | allow)
+    id=${2:-}
+    [[ $id =~ ^[0-9]+$ ]] || die "请写上用户ID（纯数字），例如：rss-tg-bot $command 123456789。用户ID 可以私聊机器人发送 /whoami 查看。"
+    if [[ $command == admin ]]; then
+      if list_add ADMIN_USER_IDS "$id"; then info "已添加管理员：$id"; else info "$id 已经是管理员。"; fi
+      # With a whitelist enabled, an admin who is not on it could not use the bot.
+      if [[ -n $(get_env ALLOWED_USER_IDS) ]] && list_add ALLOWED_USER_IDS "$id"; then
+        info "已开启白名单，同时把 $id 加入了白名单。"
+      fi
+    else
+      was_empty=0
+      [[ -z $(get_env ALLOWED_USER_IDS) ]] && was_empty=1
+      if list_add ALLOWED_USER_IDS "$id"; then info "已把 $id 加入白名单。"; else info "$id 已经在白名单里。"; fi
+      if [[ $was_empty -eq 1 ]]; then
+        # Turning the whitelist on must not lock out the administrators.
+        IFS=',' read -ra admin_ids <<<"$(get_env ADMIN_USER_IDS)"
+        for admin_id in "${admin_ids[@]}"; do
+          if [[ -n $admin_id ]] && list_add ALLOWED_USER_IDS "$admin_id"; then
+            info "管理员 $admin_id 也已自动加入白名单。"
+          fi
+        done
+        info "白名单已开启：从现在起只有名单里的用户能使用机器人。"
+      fi
+    fi
+    echo "当前管理员：$(get_env ADMIN_USER_IDS)"
+    echo "当前白名单：$(get_env ALLOWED_USER_IDS)"
+    restart_and_check
+    ;;
+  uninstall)
+    exec bash "$APP_DIR/scripts/uninstall.sh" "${@:2}"
+    ;;
+  *)
+    echo "没有 $command 这个命令。" >&2
+    echo >&2
+    usage >&2
+    exit 1
+    ;;
+esac
