@@ -121,4 +121,4 @@ sudo bash /opt/rss-tg-bot/scripts/uninstall.sh
 - 全量推送：`/all 1 on`
 - 关键词推送：`/keywords OpenAI,Claude`
 
-最后发送 `/status` 检查。在 Telegram 里发送 `/help` 可以查看使用说明，发送 `/help 关键词`、`/help 版块`、`/help 目标` 等可以查看分类说明。
+最后发送 `/status` 检查。在 Telegram 里发送 `/help` 可以查看使用说明，点下方按钮可以切换到各个分类的详细说明。
