@@ -27,13 +27,15 @@ from telegram import (  # noqa: E402
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllPrivateChats,
     BotCommandScopeChat,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     LinkPreviewOptions,
     MessageOriginChannel,
     Update,
 )
 from telegram.constants import ParseMode  # noqa: E402
 from telegram.error import BadRequest, ChatMigrated, Forbidden, NetworkError, RetryAfter, TelegramError
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
@@ -276,175 +278,257 @@ store = Store(DB_PATH)
 
 
 # ---------------------------------------------------------------------------
+# Formatting helpers
+#
+# Every reply is sent as Telegram HTML.  Dynamic values (feed titles,
+# keywords, section names, error texts...) must go through e(); example
+# commands that take arguments go through c(), which renders them in a
+# monospace "tap to copy" style.  Telegram only makes the "/command" part of
+# "/command arg" clickable, so a clickable "/subscribe 1" would actually send
+# a bare "/subscribe".  Commands without arguments stay plain and clickable.
+# ---------------------------------------------------------------------------
+
+def e(value) -> str:
+    return html.escape(str(value), quote=False)
+
+
+def c(command: str) -> str:
+    return f"<code>{e(command)}</code>"
+
+
+TAG_PATTERN = re.compile(r"<[^>]+>")
+
+
+def html_to_plain(text: str) -> str:
+    return html.unescape(TAG_PATTERN.sub("", text))
+
+
+# ---------------------------------------------------------------------------
 # Help texts
 # ---------------------------------------------------------------------------
 
-HELP_OVERVIEW = """📖 RSS 提醒机器人 · 使用说明
+COPY_TIP = "💡 等宽字体的命令（如 <code>/subscribe 1</code>）点一下即可复制，改成自己的内容后发送；蓝色的命令直接点就会发送。"
 
-【一篇新文章怎么决定推不推】
-① 你订阅了它所在的 RSS 源
-② 版块筛选：没选版块 = 全部版块都要
-③ 屏蔽词：标题或摘要包含任一屏蔽词 → 不推
-④ 推送模式（每个源单独设置）：
-   · 全量推送：直接推
-   · 关键词推送（默认）：包含你的关键词才推
-⑤ 推送到你的全部推送目标
-发送 /pause 可暂停全部推送。
+HELP_HOME = f"""📖 <b>使用说明</b>
 
-【最快上手】
-/feeds — 查看源，记下前面的数字（源ID）
-/subscribe 1 — 订阅源 1
-然后二选一：
-/all 1 on — 源 1 的新文章全部推送
-/keywords OpenAI,Claude — 只推包含这些词的文章
-最后用 /status 检查设置。
+<b>第一次使用，按顺序操作：</b>
+1. 发送 /feeds，查看有哪些 RSS 源。每行开头的数字是“源ID”
+2. 订阅：{c("/subscribe 1")}（1 换成你要的源ID）
+3. 选择推送方式（二选一）：
+   · 这个源的新文章全部推送：{c("/all 1 on")}
+   · 只推送包含关键词的文章：{c("/keywords OpenAI,Claude")}
+4. 发送 /status，确认最后一行是“✅ 设置完整”
 
-⚠️ 订阅后默认是“关键词推送”。没有关键词又没开全量推送，就收不到任何消息。
+⚠️ 刚订阅的源默认是“关键词推送”：如果没有添加关键词，也没有开启全量推送，就收不到任何消息。
 
-【分类说明】直接发送：
-/help 订阅 — 订阅与推送模式
-/help 关键词 — 关键词与屏蔽词
-/help 版块 — 只看某些版块
-/help 目标 — 推送到群组/频道
-/help 状态 — 状态、历史、暂停
-/help 管理 — 管理员命令
+{COPY_TIP}
 
-写法：<…> 要换成实际内容，不要输入尖括号；多个值用逗号分隔（, ， 、 都可以）。"""
+点下面的按钮查看详细说明 👇"""
 
-HELP_TOPICS = {
-    "订阅": """📖 订阅与推送模式
+HELP_TOPICS: dict[str, tuple[str, str]] = {
+    "sub": (
+        "📥 订阅与推送方式",
+        f"""📥 <b>订阅与推送方式</b>
 
-/feeds — 列出所有 RSS 源；行首数字是“源ID”
-/subscribe <源ID> — 订阅，例：/subscribe 1
-/mysources — 我的订阅及各自的推送模式
-/unsubscribe <源ID> — 取消订阅（同时清除该源的推送模式和版块选择）
+<b>订阅</b>
+/feeds — 查看所有源和源ID
+{c("/subscribe 1")} — 订阅 1 号源
+/mysources — 查看我订阅了哪些源
+{c("/unsubscribe 1")} — 取消订阅 1 号源（同时清除它的推送方式和版块设置）
 
-推送模式（每个源单独设置）：
-/all — 查看所有已订阅源的模式
-/all <源ID> on — 全量推送：该源所有新文章都推送
-/all <源ID> off — 关键词推送：只推送命中关键词的文章
+<b>推送方式</b>（每个源分别设置）
+· 全量推送：这个源的新文章都推送
+· 关键词推送：只推送包含你的关键词的文章（刚订阅时默认是这种）
 
-说明：
-· 新订阅的源默认是“关键词推送”
-· 全量推送仍然受“版块筛选”和“屏蔽词”限制
-· 只推送订阅之后出现的新文章，不补发旧文章""",
-    "关键词": """📖 关键词与屏蔽词
+/all — 查看每个源当前的推送方式
+{c("/all 1 on")} — 1 号源改为全量推送
+{c("/all 1 off")} — 1 号源改为关键词推送
 
-关键词和屏蔽词对你订阅的所有源统一生效，不能按源分别设置。
-匹配范围：文章标题 + 摘要；不区分英文大小写；只要“包含”就算命中。
-⚠️ 很短的英文词容易误命中：AI 会命中 said、mail、rain。尽量用更完整的词。
+<b>注意</b>
+· 只推送订阅之后出现的新文章，不补发旧文章
+· 全量推送的文章同样会被屏蔽词和版块筛选过滤""",
+    ),
+    "kw": (
+        "🔍 关键词与屏蔽词",
+        f"""🔍 <b>关键词与屏蔽词</b>
 
-普通关键词（包含任意一个就推送）：
-/keywords — 查看全部关键词及其 ID
-/keywords <词1,词2> — 添加，例：/keywords OpenAI,Claude
-  每个词单独成为一条关键词，各有自己的 ID
+关键词和屏蔽词对你订阅的<b>所有源</b>都生效，不能单独给某个源设置。
+机器人检查文章的标题和摘要：不区分英文大小写，只要包含就算命中。
 
-组合关键词（必须同时包含所有词）：
-/combo <词1,词2> — 例：/combo dmit,corona
-  整组算一条关键词，只有一个 ID
+<b>普通关键词</b>：包含其中任意一个就推送
+{c("/keywords OpenAI,Claude")} — 添加两个关键词
+/keywords — 查看所有关键词和它们的编号（关键词ID）
 
-管理关键词（这里的 ID 是“关键词ID”，不是源ID）：
-/kwoff <关键词ID> — 暂停，不删除
-/kwon <关键词ID> — 重新启用
-/delkw <关键词ID> — 永久删除
-（旧命令 /off、/on 仍可用，效果相同）
+<b>组合关键词</b>：必须同时包含所有词才推送
+{c("/combo dmit,corona")} — 同时包含 dmit 和 corona 才推送
 
-屏蔽词（包含任意一个就不推送，全量推送也会被拦截）：
-/block <词1,词2> — 例：/block 求购,已出
-/blocks — 查看屏蔽词及其 ID
-/delblock <屏蔽词ID> — 删除""",
-    "版块": """📖 版块筛选（每个源单独设置）
+<b>暂停、启用、删除</b>（数字是关键词ID，用 /keywords 查看）
+{c("/kwoff 3")} — 暂停 3 号关键词
+{c("/kwon 3")} — 重新启用 3 号关键词
+{c("/delkw 3")} — 删除 3 号关键词
 
-没选任何版块 = 该源全部版块都推送。
+<b>屏蔽词</b>：包含其中任意一个就不推送（全量推送也会被拦截）
+{c("/block 求购,已出")} — 添加两个屏蔽词
+/blocks — 查看屏蔽词和编号
+{c("/delblock 2")} — 删除 2 号屏蔽词
 
-第 1 步：查看源的版块及其 ID
-/sections <源ID> — 例：/sections 1
-第 2 步：只保留想要的版块
-/sections <源ID> <版块ID1,版块ID2> — 例：/sections 1 1,142
-  ⚠️ 每次设置都会“替换”之前的选择，不是追加
-恢复全部版块：
-/clearsections <源ID>
+💡 多个词之间用逗号隔开，中文逗号、英文逗号、顿号都可以。
+⚠️ 太短的英文词容易误命中，例如 AI 也会命中 said、mail。""",
+    ),
+    "sec": (
+        "🗂 版块筛选",
+        f"""🗂 <b>版块筛选</b>（每个源分别设置）
 
-说明：
-· 版块来自 RSS 文章自带的分类，是从已经抓到的文章里收集的；某个版块近期没人发帖，列表里就可能暂时没有
-· 不同源的版块ID互不通用
-· 一篇文章属于多个版块时，只要有一个被选中就会推送""",
-    "目标": """📖 推送目标（推送到哪里）
+不设置时，这个源所有版块的文章都会推送。
 
-你的所有推送目标都会收到同样的推送，不能按源分别指定。最多 {max_targets} 个。
+<b>第 1 步</b>：查看 1 号源有哪些版块
+{c("/sections 1")}
+回复里每行开头的数字是版块ID，例如：
+1. 日常（daily）
+142. 技术（tech）
 
-私聊：发送 /start 自动添加
-群组：先把机器人拉进群，由群管理员在群里发送 /addtarget
-频道：
- 1. 把机器人添加为频道管理员（需要“发布消息”权限）
- 2. 获取频道 chat_id：从频道转发任意一条消息给机器人（私聊），机器人会回复它的 chat_id；公开频道也可以直接用 @频道用户名
- 3. 在私聊中发送 /addtarget <chat_id>，例：/addtarget -1001234567890 或 /addtarget @mychannel
- 你本人也必须是该频道的管理员。
+<b>第 2 步</b>：只保留想看的版块
+{c("/sections 1 1,142")} — 只推送日常和技术
+⚠️ 每次设置都会替换之前的选择。想再加一个版块，要把所有想要的版块ID一起写上。
 
-/targets — 查看推送目标及其“目标ID”
-/deltarget <目标ID> — 删除，例：/deltarget 2""",
-    "状态": """📖 状态、历史与暂停
+<b>恢复全部版块</b>
+{c("/clearsections 1")}
 
-/status — 查看完整设置，并提示可能导致收不到推送的问题
-/history [数量] — 最近推送记录，默认 10 条，最多 50 条，例：/history 30
-/pause — 暂停你的全部推送（设置保留）
-/resume — 恢复推送
-/whoami — 显示你的用户 ID 和当前聊天的 chat_id
+<b>注意</b>
+· 版块来自文章自带的分类。新添加的源要等机器人检查一次后才能看到；最近没人发帖的版块可能暂时不显示
+· 设置版块筛选后，以后新出现的版块不会自动加入
+· 有的 RSS 不提供分类，这种源无法按版块筛选，可以改用关键词""",
+    ),
+    "target": (
+        "📤 推送到群/频道",
+        """📤 <b>推送到哪里</b>
 
-收不到推送时，先发 /status，按提示检查。""",
-    "管理": """📖 管理员命令（需要在服务器 .env 的 ADMIN_USER_IDS 中配置）
+推送会发到你的<b>每一个</b>推送目标（最多 {max_targets} 个），不能指定某个源只发到某个目标。
 
-/addfeed <RSS地址> — 添加共享源，例：/addfeed https://example.com/feed.xml
-/delfeed <源ID> — 删除源及所有人对它的订阅和设置（推送历史保留）
-/feedstatus — 各源上次检查时间、错误和订阅人数
+<b>私聊</b>：发送 /start 自动添加
 
-新源第一次抓取只建立“已读基线”，不会推送历史文章。""",
+<b>群组</b>
+1. 把机器人拉进群
+2. 群管理员在群里发送 /addtarget
+
+<b>频道</b>
+1. 把机器人设为频道管理员，并允许它发布消息
+2. 从频道转发任意一条消息给机器人，它会回复这个频道的 chat_id
+3. 在私聊里发送 <code>/addtarget -1001234567890</code>（换成上一步得到的 chat_id）
+   公开频道也可以用用户名：<code>/addtarget @频道用户名</code>
+你本人也必须是这个频道的管理员。
+
+/targets — 查看推送目标和编号（目标ID）
+<code>/deltarget 2</code> — 删除 2 号目标""",
+    ),
+    "rules": (
+        "⚙️ 推送规则",
+        f"""⚙️ <b>推送规则</b>
+
+RSS 里出现一篇新文章时，<b>同时满足</b>下面所有条件才会推送给你：
+1. 你订阅了这个源
+2. 你没有暂停推送（/pause）
+3. 文章在你选的版块里（没设置版块筛选就不限）
+4. 文章的标题和摘要里没有你的屏蔽词
+5. 这个源是全量推送；或者是关键词推送，并且文章命中了你的某个关键词
+
+满足后，会发到你所有的推送目标。
+
+<b>每个源分别设置</b>：推送方式（/all）、版块筛选
+<b>对所有源统一生效</b>：关键词、屏蔽词、暂停、推送目标
+
+<b>几种编号不要混用</b>
+· 源ID：/feeds 查看
+· 关键词ID：/keywords 查看
+· 屏蔽词ID：/blocks 查看
+· 版块ID：{c("/sections 1")} 查看（1 是源ID）
+· 目标ID：/targets 查看
+例如 {c("/all 1 off")} 里的 1 是源ID，{c("/kwoff 1")} 里的 1 是关键词ID，两者无关。""",
+    ),
+    "status": (
+        "📊 状态与历史",
+        f"""📊 <b>状态与历史</b>
+
+/status — 查看全部设置。收不到推送时先发这个，它会指出问题
+/history — 最近 10 条推送记录
+{c("/history 30")} — 最近 30 条（最多 50 条）
+/pause — 暂停所有推送（设置会保留）
+/resume — 恢复推送（暂停期间的文章不补发）
+/whoami — 查看你的用户ID；在群里发送还会显示本群的 chat_id""",
+    ),
+    "admin": (
+        "🛠 管理员命令",
+        f"""🛠 <b>管理员命令</b>
+
+需要先把管理员的用户ID写进服务器 .env 的 ADMIN_USER_IDS，并重启服务。
+
+{c("/addfeed https://example.com/feed.xml")} — 添加 RSS 源（会先试读一次）
+{c("/delfeed 3")} — 删除 3 号源，以及所有人对它的订阅和设置（推送历史保留）
+/feedstatus — 查看每个源是否读取正常
+
+新添加的源第一次检查只记录现有文章，不会推送旧文章。""",
+    ),
 }
+
+HELP_LAYOUT = [("sub", "kw"), ("sec", "target"), ("rules", "status"), ("admin",)]
 
 HELP_ALIASES = {
-    "1": "订阅", "sub": "订阅", "subscribe": "订阅", "源": "订阅",
-    "2": "关键词", "kw": "关键词", "keywords": "关键词", "屏蔽": "关键词", "屏蔽词": "关键词",
-    "3": "版块", "sections": "版块", "板块": "版块",
-    "4": "目标", "target": "目标", "targets": "目标", "频道": "目标", "群组": "目标",
-    "5": "状态", "status": "状态", "历史": "状态",
-    "6": "管理", "admin": "管理", "管理员": "管理",
+    "1": "sub", "订阅": "sub", "源": "sub", "推送方式": "sub", "模式": "sub", "sub": "sub", "subscribe": "sub",
+    "2": "kw", "关键词": "kw", "屏蔽": "kw", "屏蔽词": "kw", "kw": "kw", "keywords": "kw",
+    "3": "sec", "版块": "sec", "板块": "sec", "sections": "sec", "sec": "sec",
+    "4": "target", "目标": "target", "群组": "target", "频道": "target", "target": "target", "targets": "target",
+    "5": "rules", "规则": "rules", "rules": "rules",
+    "6": "status", "状态": "status", "历史": "status", "status": "status",
+    "7": "admin", "管理": "admin", "管理员": "admin", "admin": "admin",
 }
+
+
+def help_page(key: str) -> tuple[str, InlineKeyboardMarkup]:
+    if key in HELP_TOPICS:
+        text = HELP_TOPICS[key][1].replace("{max_targets}", str(MAX_TARGETS))
+        keyboard = [[InlineKeyboardButton("◀ 返回目录", callback_data="help:home")]]
+        return text, InlineKeyboardMarkup(keyboard)
+    keyboard = [
+        [InlineKeyboardButton(HELP_TOPICS[name][0], callback_data=f"help:{name}") for name in row] for row in HELP_LAYOUT
+    ]
+    return HELP_HOME, InlineKeyboardMarkup(keyboard)
+
 
 USER_COMMANDS = [
     ("start", "开始使用，并把私聊设为推送目标"),
     ("help", "使用说明"),
-    ("status", "查看我的设置与问题提示"),
+    ("status", "查看我的设置，并提示收不到推送的原因"),
     ("feeds", "查看可订阅的 RSS 源"),
-    ("subscribe", "订阅源：/subscribe 源ID"),
-    ("mysources", "我的订阅与推送模式"),
-    ("unsubscribe", "取消订阅：/unsubscribe 源ID"),
-    ("all", "推送模式：/all 源ID on 或 off"),
-    ("keywords", "查看或添加关键词：/keywords 词1,词2"),
-    ("combo", "添加组合关键词：/combo 词1,词2"),
-    ("kwoff", "暂停关键词：/kwoff 关键词ID"),
-    ("kwon", "启用关键词：/kwon 关键词ID"),
-    ("delkw", "删除关键词：/delkw 关键词ID"),
-    ("block", "添加屏蔽词：/block 词1,词2"),
+    ("subscribe", "订阅源，例：/subscribe 1"),
+    ("mysources", "我订阅的源和推送方式"),
+    ("unsubscribe", "取消订阅，例：/unsubscribe 1"),
+    ("all", "推送方式，例：/all 1 on 或 /all 1 off"),
+    ("keywords", "查看或添加关键词，例：/keywords OpenAI,Claude"),
+    ("combo", "添加组合关键词，例：/combo dmit,corona"),
+    ("kwoff", "暂停关键词，例：/kwoff 3"),
+    ("kwon", "启用关键词，例：/kwon 3"),
+    ("delkw", "删除关键词，例：/delkw 3"),
+    ("block", "添加屏蔽词，例：/block 求购,已出"),
     ("blocks", "查看屏蔽词"),
-    ("delblock", "删除屏蔽词：/delblock 屏蔽词ID"),
-    ("sections", "版块筛选：/sections 源ID [版块ID]"),
-    ("clearsections", "恢复全部版块：/clearsections 源ID"),
+    ("delblock", "删除屏蔽词，例：/delblock 2"),
+    ("sections", "版块筛选，例：/sections 1"),
+    ("clearsections", "恢复全部版块，例：/clearsections 1"),
     ("addtarget", "添加推送目标（群组/频道）"),
     ("targets", "查看推送目标"),
-    ("deltarget", "删除推送目标：/deltarget 目标ID"),
-    ("history", "最近推送记录：/history [数量]"),
+    ("deltarget", "删除推送目标，例：/deltarget 2"),
+    ("history", "最近的推送记录"),
     ("pause", "暂停全部推送"),
     ("resume", "恢复推送"),
-    ("whoami", "查看我的用户 ID 和当前 chat_id"),
+    ("whoami", "查看我的用户ID和当前 chat_id"),
 ]
 ADMIN_COMMANDS = [
     ("addfeed", "管理员：添加 RSS 源"),
     ("delfeed", "管理员：删除 RSS 源"),
-    ("feedstatus", "管理员：RSS 源健康状态"),
+    ("feedstatus", "管理员：RSS 源读取状态"),
 ]
 GROUP_COMMANDS = [
     ("addtarget", "群管理员：把本群设为推送目标"),
-    ("whoami", "查看我的用户 ID 和本群 chat_id"),
+    ("whoami", "查看我的用户ID和本群 chat_id"),
     ("help", "使用说明"),
 ]
 
@@ -471,16 +555,28 @@ async def guard(update: Update) -> bool:
         # Stay silent in groups so outsiders cannot make the bot spam the chat.
         if is_private(update) and update.effective_message:
             await update.effective_message.reply_text(
-                "你不在机器人允许名单内。请把 /whoami 显示的用户 ID 发给管理员。" if user else "你不在机器人允许名单内。"
+                f"你不在机器人的允许名单内。请把你的用户ID {user.id} 发给管理员。" if user else "你不在机器人的允许名单内。"
             )
         return False
     store.ensure_user(user.id)
     return True
 
 
-async def respond(update: Update, message: str) -> None:
-    for chunk in split_message(message):
-        await update.effective_message.reply_text(chunk, link_preview_options=LinkPreviewOptions(is_disabled=True))
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
+
+
+async def respond(update: Update, message: str, reply_markup=None) -> None:
+    chunks = split_message(message)
+    for index, chunk in enumerate(chunks):
+        markup = reply_markup if index == len(chunks) - 1 else None
+        try:
+            await update.effective_message.reply_text(
+                chunk, parse_mode=ParseMode.HTML, link_preview_options=NO_PREVIEW, reply_markup=markup
+            )
+        except BadRequest as error:
+            # Safety net: never leave the user without an answer because of markup.
+            log.error("HTML reply rejected (%s); sending as plain text", error)
+            await update.effective_message.reply_text(html_to_plain(chunk), link_preview_options=NO_PREVIEW, reply_markup=markup)
 
 
 def command_text(context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -528,12 +624,13 @@ def subscription_rows(user_id: int):
 def describe_subscription(user_id: int, row) -> str:
     mode = "全量推送" if row["full_push"] else "关键词推送"
     names = selected_section_names(user_id, row["id"])
-    sections_text = "全部版块" if not names else "只看：" + "、".join(display_section_name(n) for n in names)
-    disabled = "（源已停用）" if not row["enabled"] else ""
-    return f"#{row['id']} {row['title']}{disabled} — {mode} · {sections_text}"
+    sections_text = "全部版块" if not names else "只看 " + "、".join(display_section_name(n) for n in names)
+    disabled = "（已被管理员停用）" if not row["enabled"] else ""
+    return f"{row['id']}. {e(row['title'])}{disabled} — {mode} · {e(sections_text)}"
 
 
-USAGE_HINT = "\n发送 /help 查看完整说明。"
+def feed_label(feed_id: int, title: str | None) -> str:
+    return f"{feed_id} 号源「{e(title)}」" if title else f"{feed_id} 号源"
 
 
 # ---------------------------------------------------------------------------
@@ -544,33 +641,30 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await guard(update):
         return
     if not is_private(update):
-        await respond(
-            update,
-            "请在与机器人的私聊中发送 /start 完成设置。\n如需把本群设为推送目标，群管理员可在本群发送 /addtarget。",
-        )
+        await respond(update, "请在和机器人的私聊里发送 /start 完成设置。\n想把本群设为推送目标的话，请群管理员在本群发送 /addtarget。")
         return
     user = update.effective_user
     status, _ = add_target(user.id, update.effective_chat.id, user.full_name)
     target_line = {
-        "added": "✅ 当前私聊已设为推送目标。",
-        "exists": "✅ 当前私聊已是推送目标。",
-        "full": f"⚠️ 推送目标已达上限（{MAX_TARGETS} 个），当前私聊未添加。可用 /targets 查看、/deltarget 删除。",
+        "added": "✅ 已把当前私聊设为推送目标。",
+        "exists": "✅ 当前私聊已经是推送目标。",
+        "full": f"⚠️ 推送目标已达上限（{MAX_TARGETS} 个），当前私聊没有添加。发送 /targets 查看。",
     }[status]
     await respond(
         update,
-        f"""RSS 提醒机器人已就绪。
+        f"""👋 <b>欢迎使用 RSS 提醒机器人</b>
 {target_line}
 
-开始使用：
-1. /feeds — 查看 RSS 源，记下前面的数字（源ID）
-2. /subscribe 1 — 订阅源 1
-3. 二选一：
-   /all 1 on — 源 1 的新文章全部推送
-   /keywords OpenAI,Claude — 只推送包含这些词的文章
-4. /status — 检查设置
+<b>按顺序操作即可开始：</b>
+1. 发送 /feeds，查看有哪些 RSS 源，记下每行开头的数字（源ID）
+2. 订阅：{c("/subscribe 1")}（1 换成你要的源ID）
+3. 选择推送方式（二选一）：
+   · 这个源的新文章全部推送：{c("/all 1 on")}
+   · 只推送包含关键词的文章：{c("/keywords OpenAI,Claude")}
+4. 发送 /status 检查设置
 
-⚠️ 订阅后默认是“关键词推送”，没有关键词就收不到消息。
-发送 /help 查看完整说明。""",
+{COPY_TIP}
+发送 /help 查看详细说明。""",
     )
 
 
@@ -578,24 +672,33 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not await guard(update):
         return
     topic = command_text(context).casefold()
-    topic = HELP_ALIASES.get(topic, topic)
-    text = HELP_TOPICS.get(topic)
-    if text:
-        await respond(update, text.format(max_targets=MAX_TARGETS))
-    else:
-        await respond(update, HELP_OVERVIEW)
+    text, markup = help_page(HELP_ALIASES.get(topic, "home"))
+    await respond(update, text, reply_markup=markup)
+
+
+async def help_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not query.from_user or not is_allowed(query.from_user.id):
+        return
+    text, markup = help_page((query.data or "").partition(":")[2])
+    try:
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, link_preview_options=NO_PREVIEW, reply_markup=markup)
+    except BadRequest as error:
+        if "not modified" not in str(error).lower():
+            raise
 
 
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await guard(update):
         return
-    lines = [f"你的 Telegram 用户 ID：{update.effective_user.id}"]
+    lines = [f"你的用户ID：{c(update.effective_user.id)}"]
     chat = update.effective_chat
     if chat and chat.type != "private":
-        lines.append(f"当前聊天（{chat.title or '群组'}）的 chat_id：{chat.id}")
-        lines.append("群管理员可在本群直接发送 /addtarget 把本群设为推送目标。")
+        lines.append(f"本群（{e(chat.title or '群组')}）的 chat_id：{c(chat.id)}")
+        lines.append("群管理员在本群发送 /addtarget，就能把本群设为推送目标。")
     else:
-        lines.append("需要频道 chat_id？从频道转发一条消息给我即可。")
+        lines.append("需要频道的 chat_id？从频道转发任意一条消息给我即可。")
     await respond(update, "\n".join(lines))
 
 
@@ -613,13 +716,18 @@ async def feeds(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         (user_id,),
     ).fetchall()
     if not rows:
-        await respond(update, "目前还没有 RSS 源，请联系管理员用 /addfeed 添加。")
+        await respond(update, "目前还没有 RSS 源，请联系管理员添加。")
         return
     lines = []
     for row in rows:
         state = "（已停用）" if not row["enabled"] else ("  ✅ 已订阅" if row["subscribed"] else "")
-        lines.append(f"{row['id']}. {row['title']}{state}")
-    await respond(update, "可订阅的 RSS 源（行首数字 = 源ID）：\n" + "\n".join(lines) + "\n\n订阅：/subscribe <源ID>，例：/subscribe 1")
+        lines.append(f"{row['id']}. {e(row['title'])}{state}")
+    example = next((row["id"] for row in rows if row["enabled"] and not row["subscribed"]), rows[0]["id"])
+    await respond(
+        update,
+        "<b>可订阅的 RSS 源</b>（每行开头的数字是源ID）\n" + "\n".join(lines)
+        + f"\n\n订阅：{c(f'/subscribe {example}')}（数字换成你要的源ID）",
+    )
 
 
 class FeedError(Exception):
@@ -644,34 +752,36 @@ async def addfeed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await guard(update):
         return
     if not is_admin(update.effective_user.id):
-        await respond(update, "仅管理员可添加 RSS 源。管理员需要先用 /whoami 获取用户 ID，填入服务器 .env 的 ADMIN_USER_IDS 并重启服务。")
+        await respond(update, "只有管理员可以添加 RSS 源。")
         return
     url = command_text(context)
     if not url.startswith(("https://", "http://")):
-        await respond(update, "用法：/addfeed <RSS地址>\n例：/addfeed https://example.com/feed.xml")
+        await respond(update, f"请在命令后面写上 RSS 地址，例如：\n{c('/addfeed https://example.com/feed.xml')}")
         return
     if store.execute("SELECT 1 FROM feeds WHERE url=?", (url,)).fetchone():
-        await respond(update, "这个 RSS 源已存在，发送 /feeds 查看。")
+        await respond(update, "这个 RSS 源已经添加过了，发送 /feeds 查看。")
         return
     try:
         parsed = await asyncio.to_thread(fetch_feed, url)
     except Exception as error:
-        await respond(update, f"无法读取这个 RSS：{str(error)[:300]}")
+        await respond(update, f"无法读取这个 RSS：{e(str(error)[:300])}")
         return
     if not parsed.entries:
-        await respond(update, "能访问这个地址，但没有读到任何文章。请确认它是 RSS/Atom 地址。")
+        await respond(update, "能打开这个地址，但没有读到任何文章。请确认它是 RSS 或 Atom 地址。")
         return
     title = clean_text(parsed.feed.get("title", "")) or urlparse(url).netloc
     try:
         cursor = store.execute("INSERT INTO feeds(title, url) VALUES(?, ?)", (title, url))
         store.commit()
     except sqlite3.IntegrityError:
-        await respond(update, "这个 RSS 源已存在，发送 /feeds 查看。")
+        await respond(update, "这个 RSS 源已经添加过了，发送 /feeds 查看。")
         return
     feed_id = cursor.lastrowid
     await respond(
         update,
-        f"✅ 已添加源 #{feed_id}：{title}\n用户可发送 /subscribe {feed_id} 订阅。\n首次抓取只建立“已读基线”，不会推送历史文章。",
+        f"✅ 已添加 {feed_label(feed_id, title)}\n"
+        f"用户发送 {c(f'/subscribe {feed_id}')} 即可订阅。\n"
+        "第一次检查只记录现有文章，不会推送旧文章。",
     )
 
 
@@ -679,15 +789,15 @@ async def delfeed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await guard(update):
         return
     if not is_admin(update.effective_user.id):
-        await respond(update, "仅管理员可删除 RSS 源。")
+        await respond(update, "只有管理员可以删除 RSS 源。")
         return
     feed_id = int_arg(context)
     if feed_id is None or len(context.args) != 1:
-        await respond(update, "用法：/delfeed <源ID>\n先用 /feeds 查看源ID。")
+        await respond(update, f"请在命令后面写上源ID，例如：{c('/delfeed 3')}\n源ID可以用 /feeds 查看。")
         return
     feed = get_feed(feed_id)
     if not feed:
-        await respond(update, f"没有 ID 为 {feed_id} 的源，发送 /feeds 查看。")
+        await respond(update, f"没有 {feed_id} 号源，发送 /feeds 查看。")
         return
     for sql in (
         "DELETE FROM subscriptions WHERE feed_id=?",
@@ -699,7 +809,7 @@ async def delfeed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ):
         store.execute(sql, (feed_id,))
     store.commit()
-    await respond(update, f"已删除源 #{feed_id} {feed['title']}，以及所有人对它的订阅、推送模式和版块选择。推送历史保留。")
+    await respond(update, f"已删除 {feed_label(feed_id, feed['title'])}，以及所有人对它的订阅和设置。推送历史保留。")
 
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -708,34 +818,34 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     feed_id = int_arg(context)
     if feed_id is None:
-        await respond(update, "用法：/subscribe <源ID>，例：/subscribe 1\n先用 /feeds 查看源ID。")
+        await respond(update, f"请在命令后面写上源ID，例如：{c('/subscribe 1')}\n源ID可以用 /feeds 查看。")
         return
     feed = get_feed(feed_id)
     if not feed or not feed["enabled"]:
-        await respond(update, f"没有可订阅的源 #{feed_id}，发送 /feeds 查看。")
+        await respond(update, f"没有可以订阅的 {feed_id} 号源，发送 /feeds 查看。")
         return
+    label = feed_label(feed_id, feed["title"])
     if is_subscribed(user_id, feed_id):
-        await respond(update, f"你已经订阅了 #{feed_id} {feed['title']}。用 /mysources 查看推送模式。")
+        await respond(update, f"你已经订阅了{label}。发送 /mysources 查看推送方式。")
         return
     store.execute("INSERT INTO subscriptions(user_id, feed_id, created_at) VALUES(?, ?, ?)", (user_id, feed_id, now()))
     store.commit()
     keyword_count = active_rule_count(user_id)
-    keyword_line = (
-        f"你已有 {keyword_count} 条启用的关键词，会立即对这个源生效。"
-        if keyword_count
-        else "⚠️ 你还没有关键词，现在这个源不会推送任何文章。"
-    )
+    if keyword_count:
+        keyword_line = f"你已有 {keyword_count} 个启用的关键词，会马上对这个源生效。"
+    else:
+        keyword_line = "⚠️ 你还没有关键词，所以这个源现在不会推送任何文章。"
     await respond(
         update,
-        f"""✅ 已订阅 #{feed_id} {feed['title']}
-当前推送模式：关键词推送（默认）
+        f"""✅ 已订阅{label}
+当前推送方式：关键词推送（默认）
 {keyword_line}
 
-下一步二选一：
-· /all {feed_id} on — 这个源的新文章全部推送
-· /keywords 词1,词2 — 添加关键词（对你所有“关键词推送”的源生效）
+<b>下一步（二选一）：</b>
+· 这个源的新文章全部推送：{c(f"/all {feed_id} on")}
+· 添加关键词：{c("/keywords OpenAI,Claude")}（换成你想要的词；关键词对你所有关键词推送的源都生效）
 
-只会推送订阅之后出现的新文章。""",
+只推送订阅之后出现的新文章。""",
     )
 
 
@@ -745,16 +855,16 @@ async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     user_id = update.effective_user.id
     feed_id = int_arg(context)
     if feed_id is None:
-        await respond(update, "用法：/unsubscribe <源ID>\n先用 /mysources 查看你订阅的源ID。")
+        await respond(update, f"请在命令后面写上源ID，例如：{c('/unsubscribe 1')}\n你订阅的源可以用 /mysources 查看。")
         return
     if not is_subscribed(user_id, feed_id):
-        await respond(update, f"你没有订阅源 #{feed_id}。发送 /mysources 查看你的订阅。")
+        await respond(update, f"你没有订阅 {feed_id} 号源。发送 /mysources 查看你的订阅。")
         return
     feed = get_feed(feed_id)
     for table in ("subscriptions", "full_pushes", "selected_sections"):
         store.execute(f"DELETE FROM {table} WHERE user_id=? AND feed_id=?", (user_id, feed_id))
     store.commit()
-    await respond(update, f"已取消订阅 #{feed_id} {feed['title'] if feed else ''}，并清除了该源的推送模式和版块选择。")
+    await respond(update, f"已取消订阅{feed_label(feed_id, feed['title'] if feed else None)}，它的推送方式和版块设置也已清除。")
 
 
 async def my_sources(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -763,10 +873,16 @@ async def my_sources(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     user_id = update.effective_user.id
     rows = subscription_rows(user_id)
     if not rows:
-        await respond(update, "你还没有订阅任何源。先用 /feeds 查看，再用 /subscribe <源ID> 订阅。")
+        await respond(update, f"你还没有订阅任何源。先发送 /feeds 查看，再用 {c('/subscribe 1')} 订阅。")
         return
     body = "\n".join(describe_subscription(user_id, row) for row in rows)
-    await respond(update, f"我的订阅：\n{body}\n\n切换模式：/all <源ID> on 或 off\n版块筛选：/sections <源ID>")
+    first = rows[0]["id"]
+    await respond(
+        update,
+        f"<b>我的订阅</b>（每行开头的数字是源ID）\n{body}\n\n"
+        f"改推送方式：{c(f'/all {first} on')} 或 {c(f'/all {first} off')}\n"
+        f"设置版块：{c(f'/sections {first}')}",
+    )
 
 
 async def all_posts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -777,18 +893,27 @@ async def all_posts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not args:
         rows = subscription_rows(user_id)
         if not rows:
-            await respond(update, "你还没有订阅任何源。先用 /feeds 和 /subscribe <源ID>。")
+            await respond(update, f"你还没有订阅任何源。先发送 /feeds 查看，再用 {c('/subscribe 1')} 订阅。")
             return
-        body = "\n".join(f"#{r['id']} {r['title']} — {'✅ 全量推送' if r['full_push'] else '🔍 关键词推送'}" for r in rows)
-        await respond(update, f"推送模式：\n{body}\n\n切换：/all <源ID> on（全量）或 /all <源ID> off（关键词）")
+        body = "\n".join(f"{r['id']}. {e(r['title'])} — {'✅ 全量推送' if r['full_push'] else '🔍 关键词推送'}" for r in rows)
+        first = rows[0]["id"]
+        await respond(
+            update,
+            f"<b>推送方式</b>（每行开头的数字是源ID）\n{body}\n\n"
+            f"改为全量推送：{c(f'/all {first} on')}\n改为关键词推送：{c(f'/all {first} off')}",
+        )
         return
     feed_id = int_arg(context)
     option = args[1].lower() if len(args) == 2 else ""
     if feed_id is None or option not in {"on", "off"}:
-        await respond(update, "用法：/all <源ID> on 或 /all <源ID> off\n例：/all 1 on\n不带参数发送 /all 可查看当前模式。")
+        await respond(
+            update,
+            f"写法：源ID 后面加 on 或 off，例如：\n{c('/all 1 on')} — 全量推送\n{c('/all 1 off')} — 关键词推送\n"
+            "只发送 /all 可以查看当前设置。",
+        )
         return
     if not is_subscribed(user_id, feed_id):
-        await respond(update, f"你没有订阅源 #{feed_id}。先用 /mysources 查看你订阅的源ID。")
+        await respond(update, f"你没有订阅 {feed_id} 号源。发送 /mysources 查看你订阅的源。")
         return
     active = int(option == "on")
     store.execute(
@@ -797,13 +922,13 @@ async def all_posts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         (user_id, feed_id, active, now()),
     )
     store.commit()
-    title = get_feed(feed_id)["title"]
+    label = feed_label(feed_id, get_feed(feed_id)["title"])
     if active:
-        await respond(update, f"✅ #{feed_id} {title} 已切换为全量推送：所有新文章都会推送（版块筛选和屏蔽词仍然生效）。")
+        await respond(update, f"✅ {label}已改为全量推送：新文章都会推送。\n（屏蔽词和版块筛选仍然有效）")
         return
-    message = f"🔍 #{feed_id} {title} 已切换为关键词推送：只推送包含你关键词的文章。"
+    message = f"🔍 {label}已改为关键词推送：只推送包含你关键词的文章。"
     if not active_rule_count(user_id):
-        message += "\n⚠️ 你目前没有启用的关键词，这个源将收不到任何推送。用 /keywords 词1,词2 添加。"
+        message += f"\n⚠️ 你现在没有启用的关键词，这个源不会推送任何文章。添加关键词：{c('/keywords OpenAI,Claude')}"
     await respond(update, message)
 
 
@@ -816,8 +941,8 @@ def short_word_warning(words: list[str]) -> str:
     if not short:
         return ""
     return (
-        f"\n⚠️ {('、'.join(short))} 很短，按“包含”匹配容易误命中（例如 AI 会命中 said、mail）。"
-        "如推送过多，可用 /delkw 删除后改用更完整的词，或用 /combo 组合。"
+        f"\n\n⚠️ {e('、'.join(short))} 比较短，容易误命中（例如 AI 也会命中 said、mail）。"
+        "如果推送太多，可以删掉它换成更完整的词，或者用 /combo 组合关键词。"
     )
 
 
@@ -835,38 +960,45 @@ async def keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         added, skipped = [], []
         for value in values:
             if value.casefold() in existing:
-                skipped.append(f"#{existing[value.casefold()]} {value}")
+                skipped.append(f"{existing[value.casefold()]}. {e(value)}")
                 continue
             cursor = store.execute(
                 "INSERT INTO rules(user_id, kind, value, created_at) VALUES(?, 'word', ?, ?)", (user_id, value, now())
             )
-            added.append(f"#{cursor.lastrowid} {value}")
+            added.append(f"{cursor.lastrowid}. {e(value)}")
         store.commit()
-        lines = []
-        if added:
-            lines.append("✅ 已添加普通关键词（包含任意一个就推送）：\n" + "\n".join(added))
-        if skipped:
-            lines.append("已存在，未重复添加：" + "、".join(skipped))
         if not values:
-            lines.append("没有识别到关键词。用法：/keywords 词1,词2")
-        message = "\n".join(lines) + short_word_warning([v for v in values if v.casefold() not in existing])
+            await respond(update, f"没有识别到关键词。写法：{c('/keywords OpenAI,Claude')}")
+            return
+        parts = []
+        if added:
+            parts.append("✅ 已添加关键词（文章包含其中任意一个就推送）：\n" + "\n".join(added))
+        if skipped:
+            parts.append("这些关键词之前已经有了，没有重复添加：\n" + "\n".join(skipped))
+        message = "\n\n".join(parts) + short_word_warning([v for v in values if v.casefold() not in existing])
         if added and not store.execute("SELECT 1 FROM subscriptions WHERE user_id=?", (user_id,)).fetchone():
-            message += "\n提示：你还没有订阅任何源，先用 /feeds 和 /subscribe <源ID>。"
+            message += f"\n\n提示：你还没有订阅任何源。先发送 /feeds 查看，再用 {c('/subscribe 1')} 订阅。"
         await respond(update, message)
         return
     rows = store.execute("SELECT id, kind, value, active FROM rules WHERE user_id=? ORDER BY id", (user_id,)).fetchall()
     if not rows:
-        await respond(update, "你还没有关键词。\n添加：/keywords 词1,词2（任一命中）或 /combo 词1,词2（全部命中）")
+        await respond(
+            update,
+            f"你还没有关键词。\n\n添加普通关键词（包含任意一个就推送）：{c('/keywords OpenAI,Claude')}\n"
+            f"添加组合关键词（全部包含才推送）：{c('/combo dmit,corona')}",
+        )
         return
     body = "\n".join(
-        f"{r['id']}. {'组合' if r['kind'] == 'combo' else '普通'} · {display_rule(r['kind'], r['value'])} "
-        f"{'✅ 启用' if r['active'] else '⏸ 已暂停'}"
+        f"{r['id']}. {'组合' if r['kind'] == 'combo' else '普通'}：{e(display_rule(r['kind'], r['value']))}  "
+        f"{'✅ 启用中' if r['active'] else '⏸ 已暂停'}"
         for r in rows
     )
+    first = rows[0]["id"]
     await respond(
         update,
-        f"我的关键词（行首数字 = 关键词ID，对所有“关键词推送”的源生效）：\n{body}\n\n"
-        "/kwoff <ID> 暂停 · /kwon <ID> 启用 · /delkw <ID> 删除",
+        f"<b>我的关键词</b>（每行开头的数字是关键词ID）\n对你所有“关键词推送”的源生效。\n\n{body}\n\n"
+        f"暂停：{c(f'/kwoff {first}')}　启用：{c(f'/kwon {first}')}　删除：{c(f'/delkw {first}')}\n"
+        "（把数字换成要操作的关键词ID）",
     )
 
 
@@ -876,18 +1008,25 @@ async def combo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     values = unique_values(comma_values(command_text(context)))
     if len(values) < 2:
-        await respond(update, "用法：/combo 词1,词2（至少两个不同的词）\n例：/combo dmit,corona —— 同一篇文章必须同时包含这两个词。")
+        await respond(
+            update,
+            f"组合关键词至少要两个不同的词，用逗号隔开，例如：\n{c('/combo dmit,corona')}\n"
+            "表示文章必须同时包含 dmit 和 corona 才推送。",
+        )
         return
     wanted = {value.casefold() for value in values}
     for row in store.execute("SELECT id, value FROM rules WHERE user_id=? AND kind='combo'", (user_id,)):
         if {value.casefold() for value in comma_values(row["value"])} == wanted:
-            await respond(update, f"这组组合关键词已存在：#{row['id']} {display_rule('combo', row['value'])}")
+            await respond(update, f"这个组合关键词已经有了：{row['id']}. {e(display_rule('combo', row['value']))}")
             return
     cursor = store.execute(
         "INSERT INTO rules(user_id, kind, value, created_at) VALUES(?, 'combo', ?, ?)", (user_id, ",".join(values), now())
     )
     store.commit()
-    await respond(update, f"✅ 已添加组合关键词 #{cursor.lastrowid}：{' + '.join(values)}\n同一篇文章必须同时包含这些词才会推送。")
+    await respond(
+        update,
+        f"✅ 已添加组合关键词 {cursor.lastrowid}：{e(' + '.join(values))}\n文章必须同时包含这些词才会推送。",
+    )
 
 
 async def set_rule_state(update: Update, context: ContextTypes.DEFAULT_TYPE, active: int) -> None:
@@ -898,17 +1037,18 @@ async def set_rule_state(update: Update, context: ContextTypes.DEFAULT_TYPE, act
     if rule_id is None or len(context.args) != 1:
         await respond(
             update,
-            f"用法：{command} <关键词ID>，例：{command} 3\n先用 /keywords 查看关键词ID。\n"
-            "（如果你想切换某个源的推送模式，请用 /all <源ID> on 或 off）",
+            f"请在命令后面写上关键词ID，例如：{c(f'{command} 3')}\n关键词ID可以用 /keywords 查看。\n\n"
+            f"如果你想改的是某个源的推送方式，请用 {c('/all 1 on')} 或 {c('/all 1 off')}。",
         )
         return
     rule = store.execute("SELECT kind, value FROM rules WHERE id=? AND user_id=?", (rule_id, update.effective_user.id)).fetchone()
     if not rule:
-        await respond(update, f"没有找到你的关键词 #{rule_id}。发送 /keywords 查看关键词ID。")
+        await respond(update, f"没有找到你的 {rule_id} 号关键词。发送 /keywords 查看关键词ID。")
         return
     store.execute("UPDATE rules SET active=? WHERE id=?", (active, rule_id))
     store.commit()
-    await respond(update, f"{'✅ 已启用' if active else '⏸ 已暂停'}关键词 #{rule_id}：{display_rule(rule['kind'], rule['value'])}")
+    action = "✅ 已启用" if active else "⏸ 已暂停"
+    await respond(update, f"{action} {rule_id} 号关键词：{e(display_rule(rule['kind'], rule['value']))}")
 
 
 async def kwon(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -924,15 +1064,15 @@ async def delkw(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     rule_id = int_arg(context)
     if rule_id is None:
-        await respond(update, "用法：/delkw <关键词ID>，例：/delkw 3\n先用 /keywords 查看关键词ID。")
+        await respond(update, f"请在命令后面写上关键词ID，例如：{c('/delkw 3')}\n关键词ID可以用 /keywords 查看。")
         return
     rule = store.execute("SELECT kind, value FROM rules WHERE id=? AND user_id=?", (rule_id, update.effective_user.id)).fetchone()
     if not rule:
-        await respond(update, f"没有找到你的关键词 #{rule_id}。发送 /keywords 查看关键词ID。")
+        await respond(update, f"没有找到你的 {rule_id} 号关键词。发送 /keywords 查看关键词ID。")
         return
     store.execute("DELETE FROM rules WHERE id=?", (rule_id,))
     store.commit()
-    await respond(update, f"已删除关键词 #{rule_id}：{display_rule(rule['kind'], rule['value'])}")
+    await respond(update, f"已删除 {rule_id} 号关键词：{e(display_rule(rule['kind'], rule['value']))}")
 
 
 async def block(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -941,7 +1081,11 @@ async def block(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     values = unique_values(comma_values(command_text(context)))
     if not values:
-        await respond(update, "用法：/block 词1,词2，例：/block 求购,已出\n标题或摘要包含任一屏蔽词的文章不会推送。")
+        await respond(
+            update,
+            f"请在命令后面写上屏蔽词，多个词用逗号隔开，例如：\n{c('/block 求购,已出')}\n"
+            "文章的标题或摘要包含其中任意一个词就不会推送。",
+        )
         return
     existing = {
         row["value"].casefold(): row["id"] for row in store.execute("SELECT id, value FROM blocked_words WHERE user_id=?", (user_id,))
@@ -949,17 +1093,17 @@ async def block(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     added, skipped = [], []
     for value in values:
         if value.casefold() in existing:
-            skipped.append(f"#{existing[value.casefold()]} {value}")
+            skipped.append(f"{existing[value.casefold()]}. {e(value)}")
             continue
         cursor = store.execute("INSERT INTO blocked_words(user_id, value, created_at) VALUES(?, ?, ?)", (user_id, value, now()))
-        added.append(f"#{cursor.lastrowid} {value}")
+        added.append(f"{cursor.lastrowid}. {e(value)}")
     store.commit()
-    lines = []
+    parts = []
     if added:
-        lines.append("🚫 已添加屏蔽词（对所有源生效，全量推送也会被拦截）：\n" + "\n".join(added))
+        parts.append("🚫 已添加屏蔽词（对所有源生效，全量推送也会被拦截）：\n" + "\n".join(added))
     if skipped:
-        lines.append("已存在，未重复添加：" + "、".join(skipped))
-    await respond(update, "\n".join(lines))
+        parts.append("这些屏蔽词之前已经有了，没有重复添加：\n" + "\n".join(skipped))
+    await respond(update, "\n\n".join(parts))
 
 
 async def blocks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -967,10 +1111,14 @@ async def blocks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     rows = store.execute("SELECT id, value FROM blocked_words WHERE user_id=? ORDER BY id", (update.effective_user.id,)).fetchall()
     if not rows:
-        await respond(update, "你还没有屏蔽词。添加：/block 词1,词2")
+        await respond(update, f"你还没有屏蔽词。添加：{c('/block 求购,已出')}")
         return
-    body = "\n".join(f"{r['id']}. {r['value']}" for r in rows)
-    await respond(update, f"屏蔽词（行首数字 = 屏蔽词ID）：\n{body}\n\n删除：/delblock <屏蔽词ID>")
+    body = "\n".join(f"{r['id']}. {e(r['value'])}" for r in rows)
+    await respond(
+        update,
+        f"<b>我的屏蔽词</b>（每行开头的数字是屏蔽词ID）\n{body}\n\n"
+        f"删除：{c(f'/delblock {rows[0][0]}')}（把数字换成要删除的屏蔽词ID）",
+    )
 
 
 async def delblock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -978,15 +1126,15 @@ async def delblock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     block_id = int_arg(context)
     if block_id is None:
-        await respond(update, "用法：/delblock <屏蔽词ID>，例：/delblock 2\n先用 /blocks 查看屏蔽词ID。")
+        await respond(update, f"请在命令后面写上屏蔽词ID，例如：{c('/delblock 2')}\n屏蔽词ID可以用 /blocks 查看。")
         return
     row = store.execute("SELECT value FROM blocked_words WHERE id=? AND user_id=?", (block_id, update.effective_user.id)).fetchone()
     if not row:
-        await respond(update, f"没有找到你的屏蔽词 #{block_id}。发送 /blocks 查看。")
+        await respond(update, f"没有找到你的 {block_id} 号屏蔽词。发送 /blocks 查看。")
         return
     store.execute("DELETE FROM blocked_words WHERE id=?", (block_id,))
     store.commit()
-    await respond(update, f"已删除屏蔽词 #{block_id}：{row['value']}")
+    await respond(update, f"已删除 {block_id} 号屏蔽词：{e(row['value'])}")
 
 
 # ---------------------------------------------------------------------------
@@ -999,18 +1147,23 @@ async def sections(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     feed_id = int_arg(context)
     if feed_id is None:
-        await respond(update, "用法：\n/sections <源ID> — 查看版块\n/sections <源ID> <版块ID1,版块ID2> — 只看这些版块\n例：/sections 1 1,142")
+        await respond(
+            update,
+            f"请在命令后面写上源ID：\n{c('/sections 1')} — 查看 1 号源的版块\n"
+            f"{c('/sections 1 1,142')} — 1 号源只推送 1 号和 142 号版块\n你订阅的源可以用 /mysources 查看。",
+        )
         return
     feed = get_feed(feed_id)
     if not feed:
-        await respond(update, f"没有 ID 为 {feed_id} 的源。发送 /mysources 查看你订阅的源ID。")
+        await respond(update, f"没有 {feed_id} 号源。发送 /mysources 查看你订阅的源。")
         return
+    label = feed_label(feed_id, feed["title"])
     available = {
         row["id"]: row["name"] for row in store.execute("SELECT id, name FROM sections WHERE feed_id=? ORDER BY id", (feed_id,))
     }
     if len(context.args) > 1:
         if not is_subscribed(user_id, feed_id):
-            await respond(update, f"请先订阅源 #{feed_id}：/subscribe {feed_id}")
+            await respond(update, f"请先订阅这个源：{c(f'/subscribe {feed_id}')}")
             return
         requested = comma_values(" ".join(context.args[1:]))
         valid, invalid = [], []
@@ -1024,7 +1177,8 @@ async def sections(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not valid:
             await respond(
                 update,
-                f"没有有效的版块ID：{'、'.join(invalid) or '（空）'}。原有选择未改动。\n先发送 /sections {feed_id} 查看这个源的版块ID。",
+                f"{e('、'.join(invalid) or '（空）')} 不是{label}的版块ID，原来的设置没有改动。\n"
+                f"先发送 {c(f'/sections {feed_id}')} 查看这个源的版块ID。",
             )
             return
         store.execute("DELETE FROM selected_sections WHERE user_id=? AND feed_id=?", (user_id, feed_id))
@@ -1034,9 +1188,12 @@ async def sections(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
         store.commit()
         names = "、".join(display_section_name(available[section_id]) for section_id in valid)
-        message = f"✅ #{feed_id} {feed['title']} 现在只推送这些版块：{names}\n（已替换之前的选择；恢复全部：/clearsections {feed_id}）"
+        message = (
+            f"✅ {label}现在只推送这些版块：{e(names)}\n"
+            f"（之前的选择已被替换。恢复全部版块：{c(f'/clearsections {feed_id}')}）"
+        )
         if invalid:
-            message += f"\n已忽略无效的版块ID：{'、'.join(invalid)}"
+            message += f"\n这些不是有效的版块ID，已忽略：{e('、'.join(invalid))}"
         await respond(update, message)
         return
     chosen = {
@@ -1044,14 +1201,22 @@ async def sections(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         for row in store.execute("SELECT section_id FROM selected_sections WHERE user_id=? AND feed_id=?", (user_id, feed_id))
     }
     if not available:
-        await respond(update, f"#{feed_id} {feed['title']} 暂时还没有发现版块（版块从抓到的文章分类中收集，稍后再试）。")
+        await respond(
+            update,
+            f"{label}还没有发现版块。\n版块来自文章自带的分类：新添加的源要等机器人检查一次后才有；"
+            "如果一直没有，说明这个 RSS 不提供分类，可以改用关键词筛选。",
+        )
         return
-    current = "全部版块" if not chosen else "只看已勾选（✅）的版块"
-    body = "\n".join(f"{section_id}. {display_section_name(name)}{'  ✅' if section_id in chosen else ''}" for section_id, name in available.items())
+    current = "推送全部版块" if not chosen else "只推送打 ✅ 的版块"
+    body = "\n".join(
+        f"{section_id}. {e(display_section_name(name))}{'  ✅' if section_id in chosen else ''}" for section_id, name in available.items()
+    )
+    sample = ",".join(str(section_id) for section_id in list(available)[:2])
     await respond(
         update,
-        f"#{feed_id} {feed['title']} 的版块（行首数字 = 版块ID）\n当前：{current}\n\n{body}\n\n"
-        f"只看某些版块：/sections {feed_id} 版块ID1,版块ID2（会替换原选择）\n恢复全部：/clearsections {feed_id}",
+        f"<b>{label}的版块</b>（每行开头的数字是版块ID）\n当前：{current}\n\n{body}\n\n"
+        f"只推送某些版块：{c(f'/sections {feed_id} {sample}')}（换成你要的版块ID，会替换之前的选择）\n"
+        f"恢复全部版块：{c(f'/clearsections {feed_id}')}",
     )
 
 
@@ -1060,14 +1225,14 @@ async def clear_sections(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     feed_id = int_arg(context)
     if feed_id is None:
-        await respond(update, "用法：/clearsections <源ID>，例：/clearsections 1")
+        await respond(update, f"请在命令后面写上源ID，例如：{c('/clearsections 1')}")
         return
     cursor = store.execute("DELETE FROM selected_sections WHERE user_id=? AND feed_id=?", (update.effective_user.id, feed_id))
     store.commit()
     if cursor.rowcount:
-        await respond(update, f"✅ 源 #{feed_id} 已恢复为推送全部版块。")
+        await respond(update, f"✅ {feed_id} 号源已恢复为推送全部版块。")
     else:
-        await respond(update, f"源 #{feed_id} 本来就是全部版块，无需恢复。")
+        await respond(update, f"{feed_id} 号源本来就是推送全部版块，不需要恢复。")
 
 
 # ---------------------------------------------------------------------------
@@ -1075,16 +1240,17 @@ async def clear_sections(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # ---------------------------------------------------------------------------
 
 def add_target(user_id: int, chat_id: int | str, title: str) -> tuple[str, str]:
+    """Returns (status, HTML message)."""
     if store.execute("SELECT 1 FROM targets WHERE user_id=? AND chat_id=?", (user_id, str(chat_id))).fetchone():
-        return "exists", f"「{title}」已经是你的推送目标。"
+        return "exists", f"「{e(title)}」已经是你的推送目标了。"
     count = store.execute("SELECT COUNT(*) count FROM targets WHERE user_id=?", (user_id,)).fetchone()["count"]
     if count >= MAX_TARGETS:
-        return "full", f"每位用户最多 {MAX_TARGETS} 个推送目标，请先用 /targets 查看、/deltarget 删除不需要的。"
+        return "full", f"每人最多 {MAX_TARGETS} 个推送目标，已经满了。发送 /targets 查看，删掉不需要的再试。"
     store.execute(
         "INSERT INTO targets(user_id, chat_id, title, created_at) VALUES(?, ?, ?, ?)", (user_id, str(chat_id), title, now())
     )
     store.commit()
-    return "added", f"✅ 已添加推送目标：{title}（{chat_id}）"
+    return "added", f"✅ 已添加推送目标：{e(title)}（chat_id：{e(chat_id)}）"
 
 
 async def is_chat_admin(context: ContextTypes.DEFAULT_TYPE, chat_id: str | int, user_id: int) -> bool:
@@ -1117,25 +1283,27 @@ async def addtarget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args or []
     if chat.type != "private":
         if args:
-            await respond(update, "在群里请直接发送 /addtarget（不带参数）。绑定频道请在私聊中操作。")
+            await respond(update, "在群里只需要发送 /addtarget，不用加任何内容。绑定频道请在私聊里操作。")
             return
         if not await is_chat_admin(context, chat.id, user_id):
-            hint = "\n你正以匿名管理员身份发言，请先在群设置中关闭“匿名”再试。" if user_id == ANONYMOUS_ADMIN_ID else ""
-            await respond(update, "仅群管理员可以把本群设为推送目标。" + hint)
+            hint = "\n你现在是以匿名管理员身份发言，机器人无法确认身份。请先在群设置里关闭“匿名”再试。" if user_id == ANONYMOUS_ADMIN_ID else ""
+            await respond(update, "只有群管理员才能把本群设为推送目标。" + hint)
             return
         if not await bot_can_post(context, chat):
-            await respond(update, "机器人在本群没有发消息的权限，请先调整权限再试。")
+            await respond(update, "机器人在本群没有发消息的权限，请先在群设置里允许它发消息。")
             return
         _, message = add_target(user_id, chat.id, chat.title or str(chat.id))
         await respond(update, message)
         return
     if not args:
-        _, message = add_target(user_id, chat.id, update.effective_user.full_name)
+        status, message = add_target(user_id, chat.id, update.effective_user.full_name)
+        if status == "added":
+            message = "✅ 已把当前私聊设为推送目标。"
         await respond(
             update,
-            message.replace("✅ 已添加推送目标", "✅ 已把当前私聊添加为推送目标")
-            + "\n\n绑定群组：把机器人拉进群，由群管理员在群里发送 /addtarget\n"
-            "绑定频道：在私聊发送 /addtarget <频道chat_id或@用户名>（发送 /help 目标 查看详细步骤）",
+            f"{message}\n\n<b>绑定群组</b>：把机器人拉进群，由群管理员在群里发送 /addtarget\n"
+            f"<b>绑定频道</b>：在私聊发送 {c('/addtarget -1001234567890')}（换成频道的 chat_id）\n"
+            "频道的 chat_id：从频道转发任意一条消息给我就能看到。详细步骤见 /help 里的“推送到群/频道”。",
         )
         return
     raw = args[0]
@@ -1144,18 +1312,18 @@ async def addtarget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except (TelegramError, ValueError):
         await respond(
             update,
-            f"找不到 {raw}。请确认：\n1. chat_id 或 @用户名 正确（频道 chat_id 一般以 -100 开头）\n"
-            "2. 机器人已经在该群/频道中（频道需设为管理员）\n获取频道 chat_id：从频道转发一条消息给我。",
+            f"找不到 {e(raw)}。请检查：\n1. chat_id 或 @用户名 是否写对（频道的 chat_id 一般以 -100 开头）\n"
+            "2. 机器人是否已经在这个群或频道里（频道要设为管理员）\n\n频道的 chat_id：从频道转发任意一条消息给我就能看到。",
         )
         return
     if target_chat.type not in {"group", "supergroup", "channel"}:
-        await respond(update, "只能绑定群组或频道。私聊目标请直接发送 /start。")
+        await respond(update, "这里只能绑定群组或频道。私聊发送 /start 就会自动设为推送目标。")
         return
     if not await is_chat_admin(context, target_chat.id, user_id):
-        await respond(update, "无法确认你是该群/频道的管理员。只有管理员才能绑定；如果是频道，机器人也必须是频道管理员。")
+        await respond(update, "无法确认你是这个群或频道的管理员。只有管理员才能绑定；绑定频道时，机器人也必须是频道管理员。")
         return
     if not await bot_can_post(context, target_chat):
-        await respond(update, "机器人在该群/频道没有发消息的权限。频道需要把机器人设为管理员并开启“发布消息”权限。")
+        await respond(update, "机器人在这个群或频道里没有发消息的权限。频道需要把机器人设为管理员，并允许它发布消息。")
         return
     _, message = add_target(user_id, target_chat.id, target_chat.title or target_chat.username or str(target_chat.id))
     await respond(update, message)
@@ -1166,12 +1334,13 @@ async def targets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     rows = store.execute("SELECT id, chat_id, title FROM targets WHERE user_id=? ORDER BY id", (update.effective_user.id,)).fetchall()
     if not rows:
-        await respond(update, "你还没有推送目标。私聊发送 /start 即可把私聊设为推送目标。")
+        await respond(update, "你还没有推送目标。在私聊里发送 /start，就会把私聊设为推送目标。")
         return
-    body = "\n".join(f"{r['id']}. {r['title'] or r['chat_id']}（{r['chat_id']}）" for r in rows)
+    body = "\n".join(f"{r['id']}. {e(r['title'] or r['chat_id'])}（chat_id：{e(r['chat_id'])}）" for r in rows)
     await respond(
         update,
-        f"推送目标（行首数字 = 目标ID，{len(rows)}/{MAX_TARGETS}）：\n{body}\n\n所有目标都会收到相同的推送。删除：/deltarget <目标ID>",
+        f"<b>我的推送目标</b>（每行开头的数字是目标ID，共 {len(rows)}/{MAX_TARGETS} 个）\n{body}\n\n"
+        f"每个目标都会收到同样的推送。\n删除：{c(f'/deltarget {rows[-1][0]}')}（把数字换成要删除的目标ID）",
     )
 
 
@@ -1180,15 +1349,15 @@ async def deltarget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     target_id = int_arg(context)
     if target_id is None:
-        await respond(update, "用法：/deltarget <目标ID>，例：/deltarget 2\n先用 /targets 查看目标ID。")
+        await respond(update, f"请在命令后面写上目标ID，例如：{c('/deltarget 2')}\n目标ID可以用 /targets 查看。")
         return
     row = store.execute("SELECT chat_id, title FROM targets WHERE id=? AND user_id=?", (target_id, update.effective_user.id)).fetchone()
     if not row:
-        await respond(update, f"没有找到你的推送目标 #{target_id}。发送 /targets 查看。")
+        await respond(update, f"没有找到你的 {target_id} 号推送目标。发送 /targets 查看。")
         return
     store.execute("DELETE FROM targets WHERE id=?", (target_id,))
     store.commit()
-    await respond(update, f"已删除推送目标 #{target_id}：{row['title'] or row['chat_id']}")
+    await respond(update, f"已删除 {target_id} 号推送目标：{e(row['title'] or row['chat_id'])}")
 
 
 async def forwarded_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1199,10 +1368,11 @@ async def forwarded_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         chat = origin.chat
         await respond(
             update,
-            f"频道「{chat.title}」的 chat_id：{chat.id}\n\n确认机器人已是该频道管理员（有“发布消息”权限）后，发送：\n/addtarget {chat.id}",
+            f"频道「{e(chat.title)}」的 chat_id 是 {c(chat.id)}\n\n"
+            f"先确认机器人已经是这个频道的管理员（允许发布消息），然后发送：\n{c(f'/addtarget {chat.id}')}",
         )
         return
-    await respond(update, "这条转发消息不是来自频道，无法识别频道 chat_id。\n绑定群组：请由群管理员直接在群里发送 /addtarget。")
+    await respond(update, "这条消息不是从频道转发来的，看不到频道的 chat_id。\n绑定群组的话，请群管理员直接在群里发送 /addtarget。")
 
 
 # ---------------------------------------------------------------------------
@@ -1213,7 +1383,7 @@ async def pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await guard(update):
         store.execute("UPDATE users SET paused=1 WHERE user_id=?", (update.effective_user.id,))
         store.commit()
-        await respond(update, "⏸ 已暂停你的全部推送，设置都会保留。恢复：/resume")
+        await respond(update, "⏸ 已暂停你的所有推送，设置都会保留。恢复请发送 /resume")
 
 
 async def resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1240,11 +1410,15 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     entries = []
     for r in rows:
-        state = "✅ 已发送" if r["status"] == "sent" else f"❌ 发送失败（{(r['error'] or '未知错误')[:80]}）"
+        state = "✅ 已发送" if r["status"] == "sent" else f"❌ 发送失败：{e((r['error'] or '未知原因')[:80])}"
+        title = e(r["title"])
+        if (r["link"] or "").startswith(("http://", "https://")):
+            title = f'<a href="{html.escape(r["link"], quote=True)}">{title}</a>'
         entries.append(
-            f"[{r['feed']}] {r['title']}\n命中：{r['matched']} · {state}\n→ {r['target']} · {format_time(r['sent_at'])}\n{r['link'] or ''}".rstrip()
+            f"<b>[{e(r['feed'])}]</b> {title}\n命中：{e(r['matched'])} · {state}\n发到：{e(r['target'])} · {format_time(r['sent_at'])}"
         )
-    await respond(update, f"最近 {len(rows)} 条推送记录（时间：{DISPLAY_TZ_NAME}）：\n\n" + "\n\n".join(entries))
+    tail = "" if requested else f"\n\n查看更多：{c('/history 30')}（最多 50 条）"
+    await respond(update, f"<b>最近 {len(rows)} 条推送记录</b>（{e(DISPLAY_TZ_NAME)} 时间）\n\n" + "\n\n".join(entries) + tail)
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1258,38 +1432,40 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     block_total = store.execute("SELECT COUNT(*) c FROM blocked_words WHERE user_id=?", (user_id,)).fetchone()["c"]
     target_total = store.execute("SELECT COUNT(*) c FROM targets WHERE user_id=?", (user_id,)).fetchone()["c"]
 
-    lines = [f"状态：{'⏸ 已暂停（/resume 恢复）' if paused else '▶️ 运行中'}", ""]
+    lines = [f"<b>我的状态</b>：{'⏸ 已暂停' if paused else '▶️ 推送中'}", ""]
     if subs:
-        lines.append(f"订阅源（{len(subs)}）：")
-        lines.extend("· " + describe_subscription(user_id, row) for row in subs)
+        lines.append(f"<b>订阅的源</b>（{len(subs)} 个）")
+        lines.extend(describe_subscription(user_id, row) for row in subs)
     else:
-        lines.append("订阅源：无")
+        lines.append("<b>订阅的源</b>：无")
     lines += [
-        f"关键词：启用 {rule_active} / 共 {rule_total}",
-        f"屏蔽词：{block_total}",
-        f"推送目标：{target_total} / {MAX_TARGETS}",
-        f"RSS 检查间隔：{POLL_INTERVAL} 秒",
+        "",
+        f"关键词：{rule_active} 个启用中（共 {rule_total} 个）",
+        f"屏蔽词：{block_total} 个",
+        f"推送目标：{target_total} 个（最多 {MAX_TARGETS} 个）",
+        f"检查 RSS 的间隔：{POLL_INTERVAL} 秒",
     ]
 
     problems = []
     if paused:
-        problems.append("推送已暂停，发送 /resume 恢复。")
+        problems.append("推送已暂停。发送 /resume 恢复。")
     if not subs:
-        problems.append("还没有订阅任何源：/feeds 查看，/subscribe <源ID> 订阅。")
+        problems.append(f"还没有订阅任何源。发送 /feeds 查看，再用 {c('/subscribe 1')} 订阅。")
     if not target_total:
-        problems.append("没有推送目标：私聊发送 /start 添加。")
-    keyword_feeds = [f"#{row['id']}" for row in subs if not row["full_push"]]
+        problems.append("没有推送目标。在私聊里发送 /start 添加。")
+    keyword_feeds = [row["id"] for row in subs if not row["full_push"]]
     if keyword_feeds and not rule_active:
+        ids = "、".join(f"{feed_id} 号" for feed_id in keyword_feeds)
         problems.append(
-            f"源 {'、'.join(keyword_feeds)} 是关键词推送，但你没有启用的关键词，它们不会推送任何文章。"
-            "用 /keywords 添加关键词，或用 /all <源ID> on 改成全量推送。"
+            f"{ids}源是关键词推送，但你没有启用的关键词，所以不会推送任何文章。"
+            f"添加关键词：{c('/keywords OpenAI,Claude')}；或者改成全量推送：{c(f'/all {keyword_feeds[0]} on')}"
         )
     if any(not row["enabled"] for row in subs):
-        problems.append("有订阅的源已被管理员停用。")
+        problems.append("你订阅的源里有被管理员停用的。")
     if problems:
-        lines += ["", "⚠️ 需要注意："] + [f"{index}. {text}" for index, text in enumerate(problems, 1)]
+        lines += ["", "<b>⚠️ 需要处理：</b>"] + [f"{index}. {text}" for index, text in enumerate(problems, 1)]
     else:
-        lines += ["", "✅ 设置完整。有符合条件的新文章时就会推送。"]
+        lines += ["", "✅ 设置完整。有符合条件的新文章时就会推送给你。"]
     await respond(update, "\n".join(lines))
 
 
@@ -1297,35 +1473,35 @@ async def feedstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not await guard(update):
         return
     if not is_admin(update.effective_user.id):
-        await respond(update, "仅管理员可用。")
+        await respond(update, "只有管理员可以使用这个命令。")
         return
     rows = store.execute(
         "SELECT f.id, f.title, f.url, f.enabled, f.last_checked, f.last_error, "
         "(SELECT COUNT(*) FROM subscriptions s WHERE s.feed_id=f.id) subscribers FROM feeds f ORDER BY f.id"
     ).fetchall()
     if not rows:
-        await respond(update, "还没有源。添加：/addfeed <RSS地址>")
+        await respond(update, f"还没有 RSS 源。添加：{c('/addfeed https://example.com/feed.xml')}")
         return
     body = "\n\n".join(
-        f"{r['id']}. {r['title']}{'（已停用）' if not r['enabled'] else ''}\n{r['url']}\n"
+        f"<b>{r['id']}. {e(r['title'])}</b>{'（已停用）' if not r['enabled'] else ''}\n{e(r['url'])}\n"
         f"订阅人数：{r['subscribers']} · 上次检查：{format_time(r['last_checked'])}\n"
-        f"{'❌ 错误：' + r['last_error'] if r['last_error'] else '✅ 正常'}"
+        f"{'❌ 读取失败：' + e(r['last_error']) if r['last_error'] else '✅ 读取正常'}"
         for r in rows
     )
-    await respond(update, f"RSS 源状态（时间：{DISPLAY_TZ_NAME}）：\n\n{body}")
+    await respond(update, f"<b>RSS 源状态</b>（{e(DISPLAY_TZ_NAME)} 时间）\n\n{body}")
 
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await guard(update):
         return
     command = (update.effective_message.text or "").split()[0]
-    await respond(update, f"没有 {command} 这个命令。发送 /help 查看可用命令。")
+    await respond(update, f"没有 {e(command)} 这个命令。发送 /help 查看所有命令。")
 
 
 async def plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await guard(update):
         return
-    await respond(update, "我只处理以 / 开头的命令。发送 /help 查看使用说明。")
+    await respond(update, "请发送以 / 开头的命令。不知道怎么用的话，发送 /help 查看说明。")
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1635,6 +1811,7 @@ def build_application() -> Application:
     app = Application.builder().token(TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
     for name, handler in COMMAND_HANDLERS.items():
         app.add_handler(CommandHandler(name, handler))
+    app.add_handler(CallbackQueryHandler(help_button, pattern=r"^help:"))
     private = filters.ChatType.PRIVATE
     app.add_handler(MessageHandler(private & filters.FORWARDED, forwarded_message))
     app.add_handler(MessageHandler(private & filters.COMMAND, unknown_command))

@@ -39,14 +39,50 @@ from telegram.error import Forbidden, RetryAfter  # noqa: E402
 # Fakes
 # ---------------------------------------------------------------------------
 
+ALLOWED_TAG = re.compile(r'</?(b|i|u|s|code|pre)>|<a href="[^"<>]*">|</a>')
+ENTITY = re.compile(r"&(lt|gt|amp|quot|#\d+);")
+
+
+def assert_telegram_html(text: str) -> None:
+    """Reject anything Telegram's HTML parser would refuse."""
+    stripped = ALLOWED_TAG.sub("", text)
+    if "<" in stripped or ">" in stripped:
+        raise AssertionError(f"unescaped < or > in: {text!r}")
+    if "&" in ENTITY.sub("", stripped):
+        raise AssertionError(f"unescaped & in: {text!r}")
+    for tag in ("b", "i", "u", "s", "code", "pre", "a"):
+        opened = len(re.findall(rf"<{tag}[ >]", text))
+        if opened != text.count(f"</{tag}>"):
+            raise AssertionError(f"unbalanced <{tag}> in: {text!r}")
+    if len(text) > 4096:
+        raise AssertionError("message longer than 4096 characters")
+
+
+CLICKABLE_WITH_ARGS = re.compile(r"(?<![\w/.])/([a-z]+)[ \t]+([A-Za-z0-9@\-][^\s]*)")
+
+
+def assert_no_clickable_command_with_args(text: str) -> None:
+    """Telegram only sends the "/command" part when tapped, so arguments must be in <code>."""
+    outside = re.sub(r"<code>.*?</code>", "", text)
+    outside = re.sub(r"<a href=\"[^\"]*\">.*?</a>", "", outside)  # article titles in /history
+    match = CLICKABLE_WITH_ARGS.search(app.html_to_plain(outside))
+    if match:
+        raise AssertionError(f"clickable command with argument {match.group(0)!r} in: {text!r}")
+
+
 class FakeMessage:
     def __init__(self, text="", forward_origin=None):
         self.text = text
         self.forward_origin = forward_origin
         self.replies: list[str] = []
+        self.markups: list = []
 
     async def reply_text(self, text, **kwargs):
+        if kwargs.get("parse_mode") == "HTML":
+            assert_telegram_html(text)
+            assert_no_clickable_command_with_args(text)
         self.replies.append(text)
+        self.markups.append(kwargs.get("reply_markup"))
 
 
 class FakeBot:
@@ -175,14 +211,28 @@ class HelperTests(unittest.TestCase):
         )
         self.assertEqual(app.push_card("T"), "<b>T</b>")
 
-    def test_help_texts_render(self):
-        for topic in app.HELP_TOPICS.values():
-            rendered = topic.format(max_targets=app.MAX_TARGETS)
-            self.assertNotIn("{", rendered)
-            self.assertLess(len(rendered), 4096)
-        self.assertLess(len(app.HELP_OVERVIEW), 4096)
+    def test_help_pages_are_valid_telegram_html(self):
+        for key in ["home", *app.HELP_TOPICS]:
+            text, markup = app.help_page(key)
+            assert_telegram_html(text)
+            self.assertNotIn("{", text)
+            self.assertNotIn("}", text)
+            buttons = [button for row in markup.inline_keyboard for button in row]
+            for button in buttons:
+                self.assertTrue(app.help_page(button.callback_data.partition(":")[2]))
+                self.assertLessEqual(len(button.callback_data.encode()), 64)
+        home_buttons = [b.callback_data for row in app.help_page("home")[1].inline_keyboard for b in row]
+        self.assertEqual(sorted(home_buttons), sorted(f"help:{key}" for key in app.HELP_TOPICS))
         for alias, topic in app.HELP_ALIASES.items():
             self.assertIn(topic, app.HELP_TOPICS, alias)
+
+    def test_commands_with_arguments_are_never_clickable(self):
+        """Telegram would only send the bare command, so args must be inside <code>."""
+        pages = [app.help_page(key)[0] for key in ["home", *app.HELP_TOPICS]]
+        for page in pages:
+            outside_code = re.sub(r"<code>.*?</code>", "", page)
+            for match in re.finditer(r"(?<![\w/.])/([a-z]+)[ \t]+([A-Za-z0-9@\-][^\s]*)", outside_code):
+                self.fail(f"clickable command with argument: {match.group(0)!r} in {page[:40]!r}")
 
     def test_command_menu_is_valid_for_telegram(self):
         for name, description in app.USER_COMMANDS + app.ADMIN_COMMANDS + app.GROUP_COMMANDS:
@@ -192,7 +242,7 @@ class HelperTests(unittest.TestCase):
         self.assertLessEqual(len(app.USER_COMMANDS + app.ADMIN_COMMANDS), 100)
 
     def test_every_command_mentioned_in_help_exists(self):
-        help_text = app.HELP_OVERVIEW + "".join(app.HELP_TOPICS.values())
+        help_text = app.html_to_plain(app.HELP_HOME + "".join(text for _, text in app.HELP_TOPICS.values()))
         for command in set(re.findall(r"(?<![\w/.])/([a-z]+)", help_text)):
             self.assertIn(command, app.COMMAND_HANDLERS, command)
 
@@ -330,24 +380,50 @@ class CommandTests(unittest.TestCase):
         self.feed_id = add_feed("NodeSeek")
 
     def test_start_in_private_and_group(self):
-        self.assertIn("当前私聊已设为推送目标", call(app.start))
-        self.assertIn("当前私聊已是推送目标", call(app.start))
-        self.assertIn("请在与机器人的私聊中", call(app.start, chat_type="supergroup", chat_id=-100))
+        self.assertIn("已把当前私聊设为推送目标", call(app.start))
+        self.assertIn("当前私聊已经是推送目标", call(app.start))
+        self.assertIn("请在和机器人的私聊里", call(app.start, chat_type="supergroup", chat_id=-100))
 
     def test_help_topics(self):
-        self.assertIn("一篇新文章怎么决定推不推", call(app.help_command))
+        message = FakeMessage()
+        self.assertIn("第一次使用", call(app.help_command, message=message))
+        self.assertIsNotNone(message.markups[-1])  # topic buttons are attached
         self.assertIn("组合关键词", call(app.help_command, args=["关键词"]))
         self.assertIn("组合关键词", call(app.help_command, args=["2"]))
         self.assertIn("最多 10 个", call(app.help_command, args=["目标"]))
-        self.assertIn("一篇新文章怎么决定推不推", call(app.help_command, args=["不存在"]))
+        self.assertIn("同时满足", call(app.help_command, args=["规则"]))
+        self.assertIn("第一次使用", call(app.help_command, args=["不存在"]))
+
+    def test_help_buttons_switch_pages(self):
+        edits = []
+
+        class Query:
+            from_user = SimpleNamespace(id=10)
+
+            def __init__(self, data):
+                self.data = data
+
+            async def answer(self):
+                pass
+
+            async def edit_message_text(self, text, **kwargs):
+                assert_telegram_html(text)
+                edits.append((text, kwargs["reply_markup"]))
+
+        for data in ["help:kw", "help:home", "help:unknown"]:
+            run(app.help_button(SimpleNamespace(callback_query=Query(data)), SimpleNamespace(bot=BOT)))
+        self.assertIn("关键词与屏蔽词", edits[0][0])
+        self.assertEqual(edits[0][1].inline_keyboard[0][0].callback_data, "help:home")
+        self.assertIn("第一次使用", edits[1][0])
+        self.assertIn("第一次使用", edits[2][0])
 
     def test_subscribe_flow_messages(self):
         reply = call(app.subscribe, args=[str(self.feed_id)])
         self.assertIn("关键词推送（默认）", reply)
         self.assertIn("还没有关键词", reply)
         self.assertIn("已经订阅", call(app.subscribe, args=[str(self.feed_id)]))
-        self.assertIn("没有可订阅的源 #99", call(app.subscribe, args=["99"]))
-        self.assertIn("用法", call(app.subscribe, args=["abc"]))
+        self.assertIn("没有可以订阅的 99 号源", call(app.subscribe, args=["99"]))
+        self.assertIn("<code>/subscribe 1</code>", call(app.subscribe, args=["abc"]))
         self.assertIn("✅ 已订阅", call(app.feeds))
         self.assertIn("关键词推送", call(app.my_sources))
 
@@ -365,35 +441,36 @@ class CommandTests(unittest.TestCase):
 
     def test_keywords_ids_dedupe_and_warning(self):
         reply = call(app.keywords, args=["OpenAI，AI、openai"])
-        self.assertIn("#1 OpenAI", reply)
-        self.assertIn("#2 AI", reply)
-        self.assertNotIn("#3", reply)
+        self.assertIn("1. OpenAI", reply)
+        self.assertIn("2. AI", reply)
+        self.assertNotIn("3.", reply)
         self.assertIn("容易误命中", reply)
-        self.assertIn("已存在", call(app.keywords, args=["ai"]))
+        self.assertIn("之前已经有了", call(app.keywords, args=["ai"]))
         listing = call(app.keywords)
-        self.assertIn("1. 普通 · OpenAI ✅ 启用", listing)
+        self.assertIn("1. 普通：OpenAI  ✅ 启用中", listing)
+        self.assertIn("<code>/kwoff 1</code>", listing)
 
     def test_rule_state_and_delete_report_missing_ids(self):
         call(app.keywords, args=["Claude"])
-        self.assertIn("已暂停关键词 #1", call(app.kwoff, args=["1"]))
+        self.assertIn("已暂停 1 号关键词", call(app.kwoff, args=["1"]))
         self.assertIn("⏸ 已暂停", call(app.keywords))
-        self.assertIn("已启用关键词 #1", call(app.kwon, args=["1"]))
-        self.assertIn("没有找到你的关键词 #9", call(app.kwoff, args=["9"]))
-        self.assertIn("/all <源ID>", call(app.kwoff, args=["1", "off"]))
+        self.assertIn("已启用 1 号关键词", call(app.kwon, args=["1"]))
+        self.assertIn("没有找到你的 9 号关键词", call(app.kwoff, args=["9"]))
+        self.assertIn("<code>/all 1 off</code>", call(app.kwoff, args=["1", "off"]))
         self.assertIn("没有找到", call(app.kwon, user_id=11, args=["1"]))  # other users' rules are invisible
-        self.assertIn("已删除关键词 #1：Claude", call(app.delkw, args=["1"]))
+        self.assertIn("已删除 1 号关键词：Claude", call(app.delkw, args=["1"]))
         self.assertIn("没有找到", call(app.delkw, args=["1"]))
 
     def test_combo(self):
-        self.assertIn("至少两个", call(app.combo, args=["a,A"]))
+        self.assertIn("至少要两个", call(app.combo, args=["a,A"]))
         self.assertIn("dmit + corona", call(app.combo, args=["dmit,corona"]))
-        self.assertIn("已存在", call(app.combo, args=["Corona,DMIT"]))
+        self.assertIn("已经有了", call(app.combo, args=["Corona,DMIT"]))
 
     def test_blocks(self):
-        self.assertIn("#1 求购", call(app.block, args=["求购,已出"]))
-        self.assertIn("已存在", call(app.block, args=["求购"]))
+        self.assertIn("1. 求购", call(app.block, args=["求购,已出"]))
+        self.assertIn("之前已经有了", call(app.block, args=["求购"]))
         self.assertIn("1. 求购", call(app.blocks))
-        self.assertIn("已删除屏蔽词 #1", call(app.delblock, args=["1"]))
+        self.assertIn("已删除 1 号屏蔽词", call(app.delblock, args=["1"]))
         self.assertIn("没有找到", call(app.delblock, args=["1"]))
 
     def test_sections_validation(self):
@@ -403,36 +480,36 @@ class CommandTests(unittest.TestCase):
         app.store.commit()
         self.assertIn("请先订阅", call(app.sections, args=[str(self.feed_id), "1"]))
         call(app.subscribe, args=[str(self.feed_id)])
-        self.assertIn("当前：全部版块", call(app.sections, args=[str(self.feed_id)]))
+        self.assertIn("当前：推送全部版块", call(app.sections, args=[str(self.feed_id)]))
         call(app.sections, args=[str(self.feed_id), "1"])
         reply = call(app.sections, args=[str(self.feed_id), "3,abc"])
-        self.assertIn("原有选择未改动", reply)
+        self.assertIn("原来的设置没有改动", reply)
         self.assertIn("日常（daily）  ✅", call(app.sections, args=[str(self.feed_id)]))
-        self.assertIn("只看：日常（daily）", call(app.my_sources))
+        self.assertIn("只看 日常（daily）", call(app.my_sources))
         self.assertIn("已恢复为推送全部版块", call(app.clear_sections, args=[str(self.feed_id)]))
-        self.assertIn("本来就是全部版块", call(app.clear_sections, args=[str(self.feed_id)]))
+        self.assertIn("本来就是推送全部版块", call(app.clear_sections, args=[str(self.feed_id)]))
 
     def test_unsubscribe_clears_sections(self):
         app.store.execute("INSERT INTO sections(feed_id, name) VALUES(?, 'daily')", (self.feed_id,))
         app.store.commit()
         call(app.subscribe, args=[str(self.feed_id)])
         call(app.sections, args=[str(self.feed_id), "1"])
-        self.assertIn("你没有订阅源 #5", call(app.unsubscribe, args=["5"]))
+        self.assertIn("你没有订阅 5 号源", call(app.unsubscribe, args=["5"]))
         self.assertIn("已取消订阅", call(app.unsubscribe, args=[str(self.feed_id)]))
         self.assertEqual(app.store.execute("SELECT COUNT(*) c FROM selected_sections").fetchone()["c"], 0)
 
     def test_all_posts(self):
-        self.assertIn("你没有订阅源", call(app.all_posts, args=[str(self.feed_id), "on"]))
+        self.assertIn("你没有订阅 1 号源", call(app.all_posts, args=[str(self.feed_id), "on"]))
         call(app.subscribe, args=[str(self.feed_id)])
-        self.assertIn("用法", call(app.all_posts, args=[str(self.feed_id), "yes"]))
-        self.assertIn("全量推送", call(app.all_posts, args=[str(self.feed_id), "on"]))
+        self.assertIn("<code>/all 1 on</code>", call(app.all_posts, args=[str(self.feed_id), "yes"]))
+        self.assertIn("已改为全量推送", call(app.all_posts, args=[str(self.feed_id), "on"]))
         self.assertIn("✅ 全量推送", call(app.all_posts))
         self.assertIn("没有启用的关键词", call(app.all_posts, args=[str(self.feed_id), "off"]))
 
     def test_targets_group_and_channel(self):
         call(app.start)
         # Group: non-admin is refused, admin succeeds.
-        self.assertIn("仅群管理员", call(app.addtarget, chat_type="supergroup", chat_id=-200, chat_title="G"))
+        self.assertIn("只有群管理员", call(app.addtarget, chat_type="supergroup", chat_id=-200, chat_title="G"))
         BOT.members[("-200", 10)] = SimpleNamespace(status="administrator")
         BOT.members[("-200", BOT.id)] = SimpleNamespace(status="member")
         self.assertIn("已添加推送目标：G", call(app.addtarget, chat_type="supergroup", chat_id=-200, chat_title="G"))
@@ -444,11 +521,11 @@ class CommandTests(unittest.TestCase):
         BOT.members[("-1001", BOT.id)] = SimpleNamespace(status="administrator", can_post_messages=False)
         self.assertIn("没有发消息的权限", call(app.addtarget, args=["-1001"]))
         BOT.members[("-1001", BOT.id)] = SimpleNamespace(status="administrator", can_post_messages=True)
-        self.assertIn("My Channel（-1001）", call(app.addtarget, args=["-1001"]))
+        self.assertIn("My Channel（chat_id：-1001）", call(app.addtarget, args=["-1001"]))
         listing = call(app.targets)
         self.assertIn("My Channel", listing)
         self.assertIn("3/10", listing)
-        self.assertIn("已删除推送目标 #3：My Channel", call(app.deltarget, args=["3"]))
+        self.assertIn("已删除 3 号推送目标：My Channel", call(app.deltarget, args=["3"]))
         self.assertIn("没有找到", call(app.deltarget, args=["3"]))
 
     def test_forwarded_channel_message_reveals_chat_id(self):
@@ -458,25 +535,62 @@ class CommandTests(unittest.TestCase):
             message_id=1,
         )
         reply = call(app.forwarded_message, message=FakeMessage("hi", forward_origin=origin))
-        self.assertIn("/addtarget -1009", reply)
-        self.assertIn("不是来自频道", call(app.forwarded_message, message=FakeMessage("hi")))
+        self.assertIn("<code>/addtarget -1009</code>", reply)
+        self.assertIn("不是从频道转发来的", call(app.forwarded_message, message=FakeMessage("hi")))
 
     def test_admin_commands(self):
-        self.assertIn("仅管理员", call(app.delfeed, args=[str(self.feed_id)]))
-        self.assertIn("仅管理员", call(app.feedstatus))
-        self.assertIn("仅管理员", call(app.addfeed, args=["https://example.com"]))
-        self.assertIn("已存在", call(app.addfeed, user_id=1, args=["https://example.com/feed"]))
+        self.assertIn("只有管理员", call(app.delfeed, args=[str(self.feed_id)]))
+        self.assertIn("只有管理员", call(app.feedstatus))
+        self.assertIn("只有管理员", call(app.addfeed, args=["https://example.com"]))
+        self.assertIn("已经添加过了", call(app.addfeed, user_id=1, args=["https://example.com/feed"]))
         self.assertIn("NodeSeek", call(app.feedstatus, user_id=1))
-        self.assertIn("没有 ID 为 99", call(app.delfeed, user_id=1, args=["99"]))
-        self.assertIn("已删除源", call(app.delfeed, user_id=1, args=[str(self.feed_id)]))
+        self.assertIn("没有 99 号源", call(app.delfeed, user_id=1, args=["99"]))
+        self.assertIn("已删除 1 号源", call(app.delfeed, user_id=1, args=[str(self.feed_id)]))
 
     def test_whitelist_is_silent_in_groups(self):
         app.ALLOWED_USER_IDS.add(1)
         try:
-            self.assertIn("不在机器人允许名单", call(app.feeds, user_id=55))
+            self.assertIn("不在机器人的允许名单内", call(app.feeds, user_id=55))
             self.assertEqual(call(app.feeds, user_id=55, chat_type="group", chat_id=-5), "")
         finally:
             app.ALLOWED_USER_IDS.clear()
+
+    def test_special_characters_never_break_html(self):
+        nasty = '<b>&"Tom & Jerry"</b> <script>'
+        app.store.execute("UPDATE feeds SET title=?, last_error=? WHERE id=?", (nasty, nasty, self.feed_id))
+        app.store.execute("INSERT INTO sections(feed_id, name) VALUES(?, ?)", (self.feed_id, nasty))
+        app.store.commit()
+        BOT.chats["-1001"] = SimpleNamespace(id=-1001, type="channel", title=nasty, username=None)
+        BOT.members[("-1001", 10)] = SimpleNamespace(status="creator")
+        BOT.members[("-1001", BOT.id)] = SimpleNamespace(status="administrator", can_post_messages=True)
+        fid = str(self.feed_id)
+        steps = [
+            (app.start, []), (app.feeds, []), (app.subscribe, [fid]), (app.my_sources, []), (app.all_posts, []),
+            (app.all_posts, [fid, "on"]), (app.all_posts, [fid, "off"]), (app.keywords, ["<x>,a&b,Tom & Jerry"]),
+            (app.keywords, []), (app.combo, ["<a>,&b"]), (app.kwoff, ["1"]), (app.kwon, ["1"]), (app.block, ["<i>,&"]),
+            (app.blocks, []), (app.sections, [fid]), (app.sections, [fid, "1"]), (app.sections, [fid, "<9>"]),
+            (app.addtarget, ["-1001"]), (app.addtarget, ["<bad>"]), (app.targets, []), (app.status, []),
+            (app.history, []), (app.feedstatus, []), (app.whoami, []), (app.delkw, ["1"]), (app.delblock, ["1"]),
+            (app.unsubscribe, [fid]), (app.delfeed, [fid]),
+        ]
+        for handler, args in steps:
+            call(handler, user_id=10 if handler is not app.feedstatus and handler is not app.delfeed else 1, args=args)
+        call(app.unknown_command, message=FakeMessage("/<b>&"))
+        call(app.whoami, chat_type="supergroup", chat_id=-5, chat_title=nasty)
+
+    def test_respond_falls_back_to_plain_text(self):
+        class StrictMessage(FakeMessage):
+            async def reply_text(self, text, **kwargs):
+                if kwargs.get("parse_mode") == "HTML":
+                    from telegram.error import BadRequest
+
+                    raise BadRequest("Can't parse entities")
+                self.replies.append(text)
+
+        message = StrictMessage()
+        update = SimpleNamespace(effective_message=message)
+        run(app.respond(update, "<b>粗体</b> &amp; <code>/x 1</code>"))
+        self.assertEqual(message.replies, ["粗体 & /x 1"])
 
     def test_history_long_output_is_split(self):
         call(app.start)
@@ -566,7 +680,7 @@ class FetchTests(unittest.TestCase):
 
     def test_addfeed_with_real_fetch(self):
         reply = call(app.addfeed, user_id=1, args=[self.base + "/feed2"])
-        self.assertIn("已添加源 #1：Local", reply)
+        self.assertIn("已添加 1 号源「Local」", reply)
         self.assertIn("无法读取", call(app.addfeed, user_id=1, args=[self.base + "/broken"]))
 
 
