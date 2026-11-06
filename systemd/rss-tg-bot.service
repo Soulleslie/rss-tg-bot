@@ -12,5 +12,25 @@ RestartSec=5
 User=root
 Environment=PYTHONUNBUFFERED=1
 
+# Sandboxing: the bot only needs to write inside /opt/rss-tg-bot (database).
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ReadWritePaths=/opt/rss-tg-bot
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
 [Install]
 WantedBy=multi-user.target
