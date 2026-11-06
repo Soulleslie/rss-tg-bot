@@ -1,0 +1,5 @@
+.env
+.venv/
+rss_tg_bot.db
+__pycache__/
+*.py[cod]
