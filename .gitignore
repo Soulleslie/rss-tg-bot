@@ -1,5 +1,8 @@
 .env
 .venv/
 rss_tg_bot.db
+rss_tg_bot.db-wal
+rss_tg_bot.db-shm
+rss_tg_bot.db-journal
 __pycache__/
 *.py[cod]
