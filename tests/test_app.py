@@ -319,6 +319,17 @@ class DeliveryTests(unittest.TestCase):
         poll(self.feed_id, [entry("6", "daily post", tags=["daily"]), entry("7", "tech post", tags=["tech"]), entry("8", "求购 tech", tags=["tech"])])
         self.assertEqual([t for _, t in BOT.sent], [app.push_card("tech post", "https://example.com/7")])
 
+    def test_full_push_ignores_keywords(self):
+        call(app.keywords, user_id=10, args=["Claude"])
+        call(app.all_posts, user_id=10, args=[str(self.feed_id), "on"])
+        poll(self.feed_id, [entry("base", "b")])
+        poll(self.feed_id, [entry("1", "Claude news"), entry("2", "unrelated post")])
+        self.assertEqual(len(BOT.sent), 2)  # keywords do not narrow a full-push feed
+        call(app.all_posts, user_id=10, args=[str(self.feed_id), "off"])
+        BOT.sent.clear()
+        poll(self.feed_id, [entry("3", "Claude again"), entry("4", "another unrelated")])
+        self.assertEqual([t for _, t in BOT.sent], [app.push_card("Claude again", "https://example.com/3")])
+
     def test_paused_user_gets_nothing(self):
         call(app.all_posts, user_id=10, args=[str(self.feed_id), "on"])
         call(app.pause, user_id=10)
@@ -460,6 +471,25 @@ class CommandTests(unittest.TestCase):
         self.assertIn("没有找到", call(app.kwon, user_id=11, args=["1"]))  # other users' rules are invisible
         self.assertIn("已删除 1 号关键词：Claude", call(app.delkw, args=["1"]))
         self.assertIn("没有找到", call(app.delkw, args=["1"]))
+
+    def test_keyword_replies_warn_about_full_push_feeds(self):
+        call(app.subscribe, args=[str(self.feed_id)])
+        self.assertNotIn("不看关键词", call(app.keywords, args=["Claude"]))
+        reply = call(app.all_posts, args=[str(self.feed_id), "on"])
+        self.assertIn("不再看关键词", reply)
+        self.assertIn(f"<code>/all {self.feed_id} off</code>", reply)
+        for reply in (
+            call(app.keywords, args=["Gemini"]),
+            call(app.keywords),
+            call(app.combo, args=["a,b"]),
+        ):
+            self.assertIn(f"{self.feed_id} 号源是全量推送，不看关键词", reply)
+        self.assertIn("全量推送（不看关键词）", call(app.my_sources))
+        self.assertIn("全量推送（不看关键词）", call(app.status))
+        self.assertIn("全量推送（不看关键词）", call(app.all_posts))
+        help_kw = call(app.help_command, args=["关键词"])
+        self.assertIn("关键词只对“关键词推送”的源生效", help_kw)
+        self.assertNotIn("关键词和屏蔽词对你订阅的", help_kw)
 
     def test_combo(self):
         self.assertIn("至少要两个", call(app.combo, args=["a,A"]))
