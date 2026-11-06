@@ -391,7 +391,12 @@ class CommandTests(unittest.TestCase):
         self.feed_id = add_feed("NodeSeek")
 
     def test_start_in_private_and_group(self):
-        self.assertIn("已把当前私聊设为推送目标", call(app.start))
+        reply = call(app.start)
+        self.assertIn("已把当前私聊设为推送目标", reply)
+        # /start and /help must describe the same steps and warnings.
+        for phrase in ("全部推送（不看关键词）", "默认是“关键词推送”"):
+            self.assertIn(phrase, reply)
+            self.assertIn(phrase, app.HELP_HOME)
         self.assertIn("当前私聊已经是推送目标", call(app.start))
         self.assertIn("请在和机器人的私聊里", call(app.start, chat_type="supergroup", chat_id=-100))
 

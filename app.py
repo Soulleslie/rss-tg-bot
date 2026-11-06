@@ -675,9 +675,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 1. 发送 /feeds，查看有哪些 RSS 源，记下每行开头的数字（源ID）
 2. 订阅：{c("/subscribe 1")}（1 换成你要的源ID）
 3. 选择推送方式（二选一）：
-   · 这个源的新文章全部推送：{c("/all 1 on")}
+   · 这个源的新文章全部推送（不看关键词）：{c("/all 1 on")}
    · 只推送包含关键词的文章：{c("/keywords OpenAI,Claude")}
 4. 发送 /status 检查设置
+
+⚠️ 刚订阅的源默认是“关键词推送”：如果没有添加关键词，也没有开启全量推送，就收不到任何消息。
 
 {COPY_TIP}
 发送 /help 查看详细说明。""",
@@ -858,7 +860,7 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 {keyword_line}
 
 <b>下一步（二选一）：</b>
-· 这个源的新文章全部推送：{c(f"/all {feed_id} on")}
+· 这个源的新文章全部推送（不看关键词）：{c(f"/all {feed_id} on")}
 · 添加关键词：{c("/keywords OpenAI,Claude")}（换成你想要的词；关键词对你所有关键词推送的源都生效）
 
 只推送订阅之后出现的新文章。""",
@@ -926,7 +928,7 @@ async def all_posts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if feed_id is None or option not in {"on", "off"}:
         await respond(
             update,
-            f"写法：源ID 后面加 on 或 off，例如：\n{c('/all 1 on')} — 全量推送\n{c('/all 1 off')} — 关键词推送\n"
+            f"写法：源ID 后面加 on 或 off，例如：\n{c('/all 1 on')} — 全量推送（不看关键词）\n{c('/all 1 off')} — 关键词推送\n"
             "只发送 /all 可以查看当前设置。",
         )
         return
