@@ -9,13 +9,28 @@ SERVICE=rss-tg-bot.service
 PYTHON="$APP_DIR/.venv/bin/python"
 
 info() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[注意]\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31m[错误]\033[0m %s\n' "$*" >&2; exit 1; }
-# safe.directory: tolerate a checkout owned by another user (e.g. copied from a Mac).
 g() { git -C "$APP_DIR" -c safe.directory="$APP_DIR" "$@"; }
 
 [[ $(id -u) -eq 0 ]] || die "请用 root 运行：sudo rss-tg-bot update"
 [[ -d "$APP_DIR/.git" ]] || die "$APP_DIR 不是 Git 工作副本，无法自动更新。请先运行 scripts/backup.sh 备份，再用一键安装命令重新部署。"
 cd "$APP_DIR"
+
+# A checkout owned by another user (e.g. files copied from a Mac keep UID 501)
+# makes git refuse to work ("dubious ownership").  Older git releases, such as
+# the one in Ubuntu 22.04, ignore `-c safe.directory`, so trust this one
+# directory in the system git config, which every git version honours.
+owner=$(stat -c %u "$APP_DIR")
+git_owner=$(stat -c %u "$APP_DIR/.git")
+if [[ $owner != 0 || $git_owner != 0 ]]; then
+  warn "$APP_DIR 的所有者不是 root（UID $owner），通常是从其他电脑上传文件造成的。"
+  warn "机器人以 root 身份运行这些代码，建议改回 root：chown -R root:root $APP_DIR"
+  if ! git config --system --get-all safe.directory 2>/dev/null | grep -qxF "$APP_DIR"; then
+    git config --system --add safe.directory "$APP_DIR"
+    info "已让 git 信任 $APP_DIR（只对这一个目录生效），继续更新。"
+  fi
+fi
 
 changed=$(g status --porcelain --untracked-files=no)
 if [[ -n $changed ]]; then
