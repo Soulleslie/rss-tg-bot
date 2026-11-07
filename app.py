@@ -9,6 +9,7 @@ import os
 import re
 import socket
 import sqlite3
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -376,6 +377,7 @@ HELP_TOPICS: dict[str, tuple[str, str]] = {
 {c("/delblock 2")} — 删除 2 号屏蔽词
 
 💡 多个词之间用逗号隔开，中文逗号、英文逗号、顿号都可以。
+💡 删除后编号不会补位，新建的接着往后排（例如删掉 6 号，下一个新建的是 8 号），这是为了防止删错。想重新整理成 1、2、3……，请管理员发送 /renumber。
 ⚠️ 太短的英文词容易误命中，例如 AI 也会命中 said、mail。""",
     ),
     "sec": (
@@ -469,8 +471,10 @@ RSS 里出现一篇新文章时，<b>同时满足</b>下面所有条件才会推
 {c("/addfeed https://example.com/feed.xml")} — 添加 RSS 源（会先试读一次）
 {c("/delfeed 3")} — 删除 3 号源，以及所有人对它的订阅和设置（推送历史保留）
 /feedstatus — 查看每个源是否读取正常
+/renumber — 整理编号：把所有人的关键词和屏蔽词按顺序重新编为 1、2、3……（会先预览，确认后才执行）
 
-新添加的源第一次检查只记录现有文章，不会推送旧文章。""",
+新添加的源第一次检查只记录现有文章，不会推送旧文章。
+删除关键词后编号不会补位，编号只增不减，这是为了防止删错；需要时用 /renumber 整理。""",
     ),
 }
 
@@ -529,6 +533,7 @@ ADMIN_COMMANDS = [
     ("addfeed", "管理员：添加 RSS 源"),
     ("delfeed", "管理员：删除 RSS 源"),
     ("feedstatus", "管理员：RSS 源读取状态"),
+    ("renumber", "管理员：把关键词和屏蔽词重新编为 1、2、3……"),
 ]
 GROUP_COMMANDS = [
     ("addtarget", "群管理员：把本群设为推送目标"),
@@ -1520,6 +1525,158 @@ async def feedstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await respond(update, f"<b>RSS 源状态</b>（{e(DISPLAY_TZ_NAME)} 时间）\n\n{body}")
 
 
+# ---------------------------------------------------------------------------
+# Renumbering keywords and blocked words (admin)
+#
+# IDs are shared by all users and never reused, so they only grow.  An admin
+# can compact them to 1..n on demand.  Nothing else references these IDs:
+# delivery history stores the matched keyword text, not the rule ID.
+# ---------------------------------------------------------------------------
+
+RENUMBER_TABLES = (("rules", "关键词"), ("blocked_words", "屏蔽词"))
+
+
+def renumber_plan(table: str) -> list[tuple[int, int]]:
+    ids = [row[0] for row in store.execute(f"SELECT id FROM {table} ORDER BY id")]
+    return [(old, new) for new, old in enumerate(ids, 1)]
+
+
+def next_id(table: str) -> int:
+    row = store.execute("SELECT seq FROM sqlite_sequence WHERE name=?", (table,)).fetchone()
+    return (row[0] if row else 0) + 1
+
+
+def renumber_needed() -> bool:
+    for table, _ in RENUMBER_TABLES:
+        plan = renumber_plan(table)
+        if any(old != new for old, new in plan) or next_id(table) != len(plan) + 1:
+            return True
+    return False
+
+
+def renumber_all() -> dict[str, dict[int, int]]:
+    """Renumber every keyword and blocked word to 1..n, keeping their order.
+
+    Runs in a single transaction: either everything is renumbered or nothing.
+    Returns {table: {old_id: new_id}}.
+    """
+    result: dict[str, dict[int, int]] = {}
+    store.commit()
+    with store.connection:
+        for table, _ in RENUMBER_TABLES:
+            plan = renumber_plan(table)
+            # Two passes through negative IDs so no step collides with an existing ID.
+            for old, new in plan:
+                if old != new:
+                    store.execute(f"UPDATE {table} SET id=? WHERE id=?", (-new, old))
+            store.execute(f"UPDATE {table} SET id=-id WHERE id<0")
+            store.execute("DELETE FROM sqlite_sequence WHERE name=?", (table,))
+            if plan:
+                store.execute("INSERT INTO sqlite_sequence(name, seq) VALUES(?, ?)", (table, len(plan)))
+            result[table] = dict(plan)
+    return result
+
+
+def describe_item(table: str, row) -> str:
+    return e(display_rule(row["kind"], row["value"])) if table == "rules" else e(row["value"])
+
+
+def user_items(table: str, user_id: int):
+    columns = "id, kind, value" if table == "rules" else "id, value"
+    return store.execute(f"SELECT {columns} FROM {table} WHERE user_id=? ORDER BY id", (user_id,)).fetchall()
+
+
+def renumber_report(user_id: int, mapping: dict[str, dict[int, int]], done: bool) -> str:
+    """Show the caller's own changes; other users' items are only counted."""
+    lines = []
+    others = []
+    for table, label in RENUMBER_TABLES:
+        rows = user_items(table, user_id)
+        inverse = {new: old for old, new in mapping[table].items()}
+        own_ids = set()
+        changes = []
+        for row in rows:
+            # After renumbering the rows already carry their new IDs.
+            if done:
+                new, old = row["id"], inverse.get(row["id"], row["id"])
+            else:
+                old, new = row["id"], mapping[table].get(row["id"], row["id"])
+            own_ids.add(old)
+            if old != new:
+                changes.append(f"{old} → {new}　{describe_item(table, row)}")
+        lines.append(f"<b>你的{label}</b>：" + ("编号不变" if not changes else ""))
+        lines.extend(changes)
+        moved_by_others = sum(1 for o, n in mapping[table].items() if o != n and o not in own_ids)
+        if moved_by_others:
+            others.append(f"{moved_by_others} 条{label}")
+    if others:
+        lines.append(f"其他用户：共有 {'、'.join(others)}的编号{'已' if done else '会'}改变")
+    return "\n".join(lines)
+
+
+def renumber_preview_mapping() -> dict[str, dict[int, int]]:
+    return {table: dict(renumber_plan(table)) for table, _ in RENUMBER_TABLES}
+
+
+RENUMBER_KEYBOARD = InlineKeyboardMarkup(
+    [[InlineKeyboardButton("✅ 确认整理", callback_data="renumber:yes"), InlineKeyboardButton("取消", callback_data="renumber:no")]]
+)
+
+
+async def renumber(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await guard(update):
+        return
+    if not is_admin(update.effective_user.id):
+        await respond(update, "只有管理员可以整理编号。")
+        return
+    if not renumber_needed():
+        await respond(update, "关键词和屏蔽词的编号已经是从 1 开始连续的，不需要整理。")
+        return
+    report = renumber_report(update.effective_user.id, renumber_preview_mapping(), done=False)
+    await respond(
+        update,
+        "🔢 <b>整理编号</b>\n"
+        "把所有用户的关键词和屏蔽词，按现在的顺序重新编为 1、2、3……之后新建的接着往后排。\n\n"
+        f"{report}\n\n"
+        "⚠️ 整理后，之前记下的编号会失效，请以 /keywords 和 /blocks 显示的为准。推送不受影响。",
+        reply_markup=RENUMBER_KEYBOARD,
+    )
+
+
+async def renumber_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not query.from_user or not is_admin(query.from_user.id):
+        return
+    if query.data != "renumber:yes":
+        text = "已取消，编号没有改动。"
+    elif not renumber_needed():
+        text = "编号已经是从 1 开始连续的，不需要整理。"
+    else:
+        mapping = renumber_all()
+        text = (
+            "✅ <b>编号已整理</b>\n\n"
+            f"{renumber_report(query.from_user.id, mapping, done=True)}\n\n"
+            f"下一个新关键词的编号是 {next_id('rules')}，新屏蔽词是 {next_id('blocked_words')}。\n"
+            "查看：/keywords　/blocks"
+        )
+    await query.edit_message_text(text, parse_mode=ParseMode.HTML, link_preview_options=NO_PREVIEW, reply_markup=None)
+
+
+def cli_renumber() -> None:
+    """`python app.py renumber`: used by `rss-tg-bot renumber` on the server."""
+    if not renumber_needed():
+        print("关键词和屏蔽词的编号已经是从 1 开始连续的，不需要整理。")
+        return
+    mapping = renumber_all()
+    for table, label in RENUMBER_TABLES:
+        changed = [(old, new) for old, new in mapping[table].items() if old != new]
+        print(f"{label}：共 {len(mapping[table])} 条，{len(changed)} 条编号改变")
+        for old, new in changed:
+            print(f"  {old} → {new}")
+        print(f"  下一个新{label}的编号：{next_id(table)}")
+
+
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await guard(update):
         return
@@ -1832,7 +1989,7 @@ COMMAND_HANDLERS = {
     "delkw": delkw, "block": block, "blocks": blocks, "delblock": delblock,
     "sections": sections, "clearsections": clear_sections, "addtarget": addtarget,
     "targets": targets, "deltarget": deltarget, "pause": pause, "resume": resume,
-    "history": history, "status": status, "feedstatus": feedstatus,
+    "history": history, "status": status, "feedstatus": feedstatus, "renumber": renumber,
 }
 
 
@@ -1841,6 +1998,7 @@ def build_application() -> Application:
     for name, handler in COMMAND_HANDLERS.items():
         app.add_handler(CommandHandler(name, handler))
     app.add_handler(CallbackQueryHandler(help_button, pattern=r"^help:"))
+    app.add_handler(CallbackQueryHandler(renumber_button, pattern=r"^renumber:"))
     private = filters.ChatType.PRIVATE
     app.add_handler(MessageHandler(private & filters.FORWARDED, forwarded_message))
     app.add_handler(MessageHandler(private & filters.COMMAND, unknown_command))
@@ -1850,6 +2008,9 @@ def build_application() -> Application:
 
 
 def main() -> None:
+    if sys.argv[1:] == ["renumber"]:
+        cli_renumber()
+        return
     if not TOKEN:
         raise SystemExit("TG_BOT_TOKEN is missing in .env")
     build_application().run_polling(drop_pending_updates=True)

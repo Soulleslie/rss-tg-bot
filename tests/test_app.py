@@ -642,6 +642,160 @@ class CommandTests(unittest.TestCase):
         self.assertTrue(all(len(r) <= 4096 for r in message.replies))
 
 
+class RenumberTests(unittest.TestCase):
+    ADMIN = 1
+
+    def setUp(self):
+        reset_db()
+
+    def ids(self, table, user_id=None):
+        sql = f"SELECT id FROM {table}" + (" WHERE user_id=?" if user_id else "") + " ORDER BY id"
+        return [r[0] for r in app.store.execute(sql, (user_id,) if user_id else ())]
+
+    def press(self, data, user_id=ADMIN):
+        edits = []
+
+        class Query:
+            from_user = SimpleNamespace(id=user_id)
+
+            def __init__(self):
+                self.data = data
+
+            async def answer(self):
+                pass
+
+            async def edit_message_text(self, text, **kwargs):
+                assert_telegram_html(text)
+                assert_no_clickable_command_with_args(text)
+                edits.append(text)
+
+        run(app.renumber_button(SimpleNamespace(callback_query=Query()), SimpleNamespace(bot=BOT)))
+        return edits[-1] if edits else None
+
+    def test_users_situation_1_to_5_and_7(self):
+        """Keyword 6 was deleted: 1,2,3,4,5,7 becomes 1..6 and the next one is 7."""
+        for i in range(1, 8):
+            call(app.combo, user_id=self.ADMIN, args=[f"出,w{i}"])
+        call(app.delkw, user_id=self.ADMIN, args=["6"])
+        self.assertEqual(self.ids("rules"), [1, 2, 3, 4, 5, 7])
+        preview = call(app.renumber, user_id=self.ADMIN)
+        self.assertIn("7 → 6", preview)
+        self.assertNotIn("1 → 1", preview)
+        self.assertEqual(self.ids("rules"), [1, 2, 3, 4, 5, 7])  # preview changes nothing
+        result = self.press("renumber:yes")
+        self.assertIn("编号已整理", result)
+        self.assertIn("下一个新关键词的编号是 7", result)
+        self.assertEqual(self.ids("rules"), [1, 2, 3, 4, 5, 6])
+        listing = call(app.keywords, user_id=self.ADMIN)
+        self.assertIn("6. 组合：出 + w7", listing)
+        for page in (app.help_page("kw")[0], app.help_page("admin")[0]):
+            self.assertIn("/renumber", page)
+            self.assertIn("不会补位", page)
+        self.assertIn("已添加组合关键词 7：出 + w8", call(app.combo, user_id=self.ADMIN, args=["出,w8"]))
+
+    def test_existing_commands_and_matching_still_work(self):
+        feed_id = add_feed()
+        call(app.start, user_id=self.ADMIN)
+        call(app.subscribe, user_id=self.ADMIN, args=[str(feed_id)])
+        call(app.keywords, user_id=self.ADMIN, args=["alpha,beta,gamma"])
+        call(app.delkw, user_id=self.ADMIN, args=["2"])
+        call(app.kwoff, user_id=self.ADMIN, args=["3"])  # gamma paused before renumbering
+        self.press("renumber:yes")
+        listing = call(app.keywords, user_id=self.ADMIN)
+        self.assertIn("1. 普通：alpha  ✅ 启用中", listing)
+        self.assertIn("2. 普通：gamma  ⏸ 已暂停", listing)  # state survives renumbering
+        self.assertIn("已启用 2 号关键词：gamma", call(app.kwon, user_id=self.ADMIN, args=["2"]))
+        poll(feed_id, [entry("base", "b")])
+        poll(feed_id, [entry("1", "alpha news"), entry("2", "beta news"), entry("3", "gamma news")])
+        self.assertEqual(
+            [t for _, t in BOT.sent],
+            [app.push_card("alpha news", "https://example.com/1"), app.push_card("gamma news", "https://example.com/3")],
+        )
+        self.assertIn("已删除 1 号关键词：alpha", call(app.delkw, user_id=self.ADMIN, args=["1"]))
+
+    def test_multiple_users_keep_order_and_privacy(self):
+        call(app.keywords, user_id=self.ADMIN, args=["a1"])   # 1
+        call(app.keywords, user_id=20, args=["x1"])           # 2
+        call(app.keywords, user_id=self.ADMIN, args=["a2"])   # 3
+        call(app.keywords, user_id=20, args=["x2"])           # 4
+        call(app.delkw, user_id=self.ADMIN, args=["1"])
+        preview = call(app.renumber, user_id=self.ADMIN)
+        self.assertIn("3 → 2", preview)
+        self.assertIn("其他用户：共有 2 条关键词的编号会改变", preview)
+        self.assertNotIn("x1", preview)  # other users' keywords are never shown
+        self.press("renumber:yes")
+        self.assertEqual(self.ids("rules", self.ADMIN), [2])
+        self.assertEqual(self.ids("rules", 20), [1, 3])
+        self.assertIn("1. 普通：x1", call(app.keywords, user_id=20))
+        self.assertIn("没有找到你的 1 号关键词", call(app.delkw, user_id=self.ADMIN, args=["1"]))  # still x1's
+
+    def test_blocked_words_too(self):
+        call(app.block, user_id=self.ADMIN, args=["b1,b2,b3"])
+        call(app.delblock, user_id=self.ADMIN, args=["1"])
+        self.press("renumber:yes")
+        self.assertEqual(self.ids("blocked_words"), [1, 2])
+        self.assertIn("1. b2", call(app.blocks, user_id=self.ADMIN))
+        self.assertIn("3. b4", call(app.block, user_id=self.ADMIN, args=["b4"]))
+
+    def test_deleted_last_items_reset_the_counter(self):
+        call(app.keywords, user_id=self.ADMIN, args=["a,b,c"])
+        for rule_id in ("1", "2", "3"):
+            call(app.delkw, user_id=self.ADMIN, args=[rule_id])
+        self.assertTrue(app.renumber_needed())  # nothing left, but next ID would be 4
+        self.press("renumber:yes")
+        self.assertIn("1. new", call(app.keywords, user_id=self.ADMIN, args=["new"]))
+
+    def test_permissions_cancel_and_nothing_to_do(self):
+        call(app.keywords, user_id=10, args=["a,b"])
+        call(app.delkw, user_id=10, args=["1"])
+        self.assertIn("只有管理员", call(app.renumber, user_id=10))
+        self.assertIsNone(self.press("renumber:yes", user_id=10))  # non-admin button press is ignored
+        self.assertEqual(self.ids("rules"), [2])
+        self.assertIn("已取消", self.press("renumber:no"))
+        self.assertEqual(self.ids("rules"), [2])
+        self.press("renumber:yes")
+        self.assertIn("不需要整理", call(app.renumber, user_id=self.ADMIN))
+        self.assertIn("不需要整理", self.press("renumber:yes"))
+
+    def test_failure_rolls_back_everything(self):
+        call(app.keywords, user_id=self.ADMIN, args=["a,b,c"])
+        call(app.block, user_id=self.ADMIN, args=["x,y"])
+        call(app.delkw, user_id=self.ADMIN, args=["1"])
+        call(app.delblock, user_id=self.ADMIN, args=["1"])
+        original = app.store.execute
+
+        def failing(sql, params=()):
+            if "blocked_words SET id" in sql:
+                raise sqlite3.OperationalError("simulated failure")
+            return original(sql, params)
+
+        app.store.execute = failing
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                app.renumber_all()
+        finally:
+            app.store.execute = original
+        self.assertEqual(self.ids("rules"), [2, 3])  # the keyword step was rolled back too
+        self.assertEqual(self.ids("blocked_words"), [2])
+        self.assertEqual(app.next_id("rules"), 4)
+
+    def test_cli(self):
+        import contextlib
+        import io
+
+        call(app.keywords, user_id=self.ADMIN, args=["a,b"])
+        call(app.delkw, user_id=self.ADMIN, args=["1"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            app.cli_renumber()
+        self.assertIn("2 → 1", out.getvalue())
+        self.assertIn("下一个新关键词的编号：2", out.getvalue())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            app.cli_renumber()
+        self.assertIn("不需要整理", out.getvalue())
+
+
 # ---------------------------------------------------------------------------
 # Real HTTP fetching (local server) and schema migration
 # ---------------------------------------------------------------------------

@@ -55,6 +55,7 @@ curl -fsSL https://raw.githubusercontent.com/Soulleslie/rss-tg-bot/main/scripts/
 | `rss-tg-bot config` | 编辑 `.env`，保存退出后自动重启 |
 | `rss-tg-bot admin <用户ID>` | 添加管理员 |
 | `rss-tg-bot allow <用户ID>` | 加入白名单。第一次使用会开启白名单，之后只有名单里的人能用；现有管理员会被自动加入 |
+| `rss-tg-bot renumber` | 把所有人的关键词和屏蔽词重新编为 1、2、3……（会先备份）。管理员也可以在机器人里发送 `/renumber` |
 
 不带参数运行 `rss-tg-bot`，可以查看全部命令。
 
