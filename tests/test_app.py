@@ -688,6 +688,9 @@ class RenumberTests(unittest.TestCase):
         self.assertEqual(self.ids("rules"), [1, 2, 3, 4, 5, 6])
         listing = call(app.keywords, user_id=self.ADMIN)
         self.assertIn("6. 组合：出 + w7", listing)
+        for page in (app.help_page("kw")[0], app.help_page("admin")[0]):
+            self.assertIn("/renumber", page)
+            self.assertIn("不会补位", page)
         self.assertIn("已添加组合关键词 7：出 + w8", call(app.combo, user_id=self.ADMIN, args=["出,w8"]))
 
     def test_existing_commands_and_matching_still_work(self):
