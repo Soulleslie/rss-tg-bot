@@ -23,6 +23,7 @@ RSS 提醒机器人 · 管理命令
   config              编辑配置文件 .env，保存退出后自动重启
   admin <用户ID>      添加管理员（用户ID：私聊机器人发送 /whoami 查看）
   allow <用户ID>      把用户加入白名单；开启白名单后只有名单里的人能用
+  renumber            把所有人的关键词和屏蔽词重新编为 1、2、3……（会先备份）
   uninstall           一键卸载（会先自动备份）
 EOF
 }
@@ -127,6 +128,17 @@ case $command in
     echo "当前管理员：$(get_env ADMIN_USER_IDS)"
     echo "当前白名单：$(get_env ALLOWED_USER_IDS)"
     restart_and_check
+    ;;
+  renumber)
+    if [[ ${2:-} != "--yes" ]]; then
+      echo "将把所有用户的关键词和屏蔽词按现在的顺序重新编为 1、2、3……，之前记下的编号会失效。推送不受影响。"
+      (exec </dev/tty) 2>/dev/null || die "没有可以输入的终端。确认的话请运行：rss-tg-bot renumber --yes"
+      printf '确认请输入 yes：' >/dev/tty
+      IFS= read -r answer </dev/tty || true
+      [[ $answer == "yes" ]] || { echo "已取消，编号没有改动。"; exit 0; }
+    fi
+    bash "$APP_DIR/scripts/backup.sh"
+    (cd "$APP_DIR" && "$APP_DIR/.venv/bin/python" app.py renumber)
     ;;
   uninstall)
     exec bash "$APP_DIR/scripts/uninstall.sh" "${@:2}"
