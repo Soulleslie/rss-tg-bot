@@ -23,7 +23,6 @@ os.environ.update(
         "POLL_INTERVAL_SECONDS": "60",
         "FETCH_TIMEOUT_SECONDS": "20",
         "DELIVERY_RETENTION_DAYS": "180",
-        "DEFAULT_MATCH_SCOPE": "title",
         "TG_BOT_TOKEN": "",
         "no_proxy": "127.0.0.1,localhost",
         "NO_PROXY": "127.0.0.1,localhost",
@@ -331,59 +330,33 @@ class DeliveryTests(unittest.TestCase):
         poll(self.feed_id, [entry("3", "Claude again"), entry("4", "another unrelated")])
         self.assertEqual([t for _, t in BOT.sent], [app.push_card("Claude again", "https://example.com/3")])
 
-    def test_match_title_only_ignores_words_in_summary(self):
+    def test_keywords_match_title_only(self):
         """The reported case: a buying post whose body happens to contain 出."""
         call(app.combo, user_id=10, args=["出,golden"])
         call(app.combo, user_id=10, args=["出,rfc"])
         poll(self.feed_id, [entry("base", "b")])
-        buying = entry("buy", "+200 收一个RFC JP T1 GOLDEN", summary="有出的老板私聊")
-        selling = entry("sell", "出 GOLDEN JP 年付", summary="价格私聊")
-        poll(self.feed_id, [buying, selling])
-        # Default is title only: the buying post no longer matches.
+        poll(
+            self.feed_id,
+            [
+                entry("buy", "+200 收一个RFC JP T1 GOLDEN", summary="有出的老板私聊"),
+                entry("sell", "出 GOLDEN JP 年付", summary="价格私聊"),
+                entry("body", "VPS 一台", summary="出 golden 线路"),  # keywords only in the body
+            ],
+        )
         self.assertEqual([t for _, t in BOT.sent], [app.push_card("出 GOLDEN JP 年付", "https://example.com/sell")])
-        self.assertIn("标题 + 摘要", call(app.match, user_id=10, args=["all"]))
-        BOT.sent.clear()
-        poll(self.feed_id, [entry("buy2", "+300 收一个RFC GOLDEN", summary="有出的私聊")])
-        self.assertEqual(len(BOT.sent), 1)  # title + summary: matched through the summary
-        call(app.match, user_id=10, args=["title"])
-        BOT.sent.clear()
-        poll(self.feed_id, [entry("buy3", "收 GOLDEN", summary="有出的私聊")])
-        self.assertEqual(BOT.sent, [])
 
-    def test_match_title_keeps_blocked_words_on_summary(self):
+    def test_blocked_words_still_check_summary(self):
         call(app.combo, user_id=10, args=["出,golden"])
         call(app.block, user_id=10, args=["求购"])
-        call(app.match, user_id=10, args=["标题"])
         poll(self.feed_id, [entry("base", "b")])
         poll(self.feed_id, [entry("x", "出 golden", summary="顺便求购一台"), entry("y", "出 golden HK", summary="")])
         self.assertEqual([t for _, t in BOT.sent], [app.push_card("出 golden HK", "https://example.com/y")])
 
-    def test_match_setting_is_per_user(self):
-        call(app.start, user_id=11)
-        call(app.subscribe, user_id=11, args=[str(self.feed_id)])
-        for user_id in (10, 11):
-            call(app.keywords, user_id=user_id, args=["golden"])
-        call(app.match, user_id=10, args=["all"])  # user 11 keeps the default (title only)
+    def test_full_push_unaffected_by_title_matching(self):
+        call(app.all_posts, user_id=10, args=[str(self.feed_id), "on"])
         poll(self.feed_id, [entry("base", "b")])
-        poll(self.feed_id, [entry("x", "出售 VPS", summary="golden 线路")])
-        self.assertEqual([chat for chat, _ in BOT.sent], ["10"])  # only the user matching summaries
-
-    def test_default_scope_is_configurable_and_explicit_choice_wins(self):
-        call(app.keywords, user_id=10, args=["golden"])
-        poll(self.feed_id, [entry("base", "b")])
-        original = app.DEFAULT_MATCH_SCOPE
-        try:
-            app.DEFAULT_MATCH_SCOPE = "all"  # admin set DEFAULT_MATCH_SCOPE=all
-            poll(self.feed_id, [entry("x", "出售 VPS", summary="golden 线路")])
-            self.assertEqual(len(BOT.sent), 1)  # user never chose: follows the server default
-            call(app.match, user_id=10, args=["title"])
-            BOT.sent.clear()
-            poll(self.feed_id, [entry("y", "出售 VPS 2", summary="golden 线路")])
-            self.assertEqual(BOT.sent, [])  # an explicit choice overrides the default
-            self.assertIn("只看标题", call(app.status, user_id=10))
-            self.assertNotIn("只看标题（默认）", call(app.status, user_id=10))
-        finally:
-            app.DEFAULT_MATCH_SCOPE = original
+        poll(self.feed_id, [entry("x", "随便一个标题", summary="")])
+        self.assertEqual(len(BOT.sent), 1)
 
     def test_paused_user_gets_nothing(self):
         call(app.all_posts, user_id=10, args=[str(self.feed_id), "on"])
@@ -551,17 +524,10 @@ class CommandTests(unittest.TestCase):
         self.assertIn("关键词只对“关键词推送”的源生效", help_kw)
         self.assertNotIn("关键词和屏蔽词对你订阅的", help_kw)
 
-    def test_match_command_replies(self):
-        reply = call(app.match)
-        self.assertIn("关键词匹配范围</b>：只看标题（默认）", reply)
-        self.assertIn("<code>/match all</code>", reply)
-        self.assertIn("匹配范围：只看标题（默认）", call(app.status))
-        self.assertIn("标题 + 摘要", call(app.match, args=["ALL"]))
-        self.assertIn("关键词匹配范围</b>：标题 + 摘要", call(app.match, args=["乱写"]))  # unknown -> show usage
-        call(app.keywords, args=["x1"])
-        self.assertIn("匹配范围：标题 + 摘要（/match 修改）", call(app.keywords))
-        self.assertIn("只看标题", call(app.match, args=["标题"]))
-        self.assertIn("默认：只看标题", app.help_page("kw")[0])
+    def test_help_explains_title_only_matching(self):
+        self.assertIn("关键词只看文章标题", call(app.help_command, args=["关键词"]))
+        self.assertIn("标题</b>命中了你的某个关键词", call(app.help_command, args=["规则"]))
+        self.assertIn("没有 /match 这个命令", call(app.unknown_command, message=FakeMessage("/match title")))
 
     def test_combo(self):
         self.assertIn("至少要两个", call(app.combo, args=["a,A"]))
@@ -947,7 +913,6 @@ CREATE TABLE feeds (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, u
 CREATE TABLE items (id INTEGER PRIMARY KEY AUTOINCREMENT, feed_id INTEGER NOT NULL, item_key TEXT NOT NULL,
   title TEXT NOT NULL, link TEXT, summary TEXT, categories TEXT, first_seen TEXT NOT NULL, UNIQUE(feed_id, item_key));
 INSERT INTO feeds(title, url, initialized) VALUES('Old', 'https://old/feed', 1);
-INSERT INTO users(user_id, paused, created_at) VALUES(7, 0, 'x');
 INSERT INTO items(feed_id, item_key, title, summary, first_seen) VALUES(1, 'k', 'T', 'long summary', '2025-01-01T00:00:00+00:00');
 """
 
@@ -965,9 +930,6 @@ class MigrationTests(unittest.TestCase):
         item = store.execute("SELECT * FROM items").fetchone()
         self.assertEqual((item["title"], item["pending"], item["summary"]), ("T", 0, None))
         self.assertEqual(store.execute("SELECT initialized FROM feeds").fetchone()["initialized"], 1)
-        self.assertIn("match_scope", store._columns("users"))
-        row = store.execute("SELECT match_scope, match_scope_set FROM users WHERE user_id=7").fetchone()
-        self.assertEqual(app.effective_scope(row[0], row[1]), app.DEFAULT_MATCH_SCOPE)  # existing users follow the default
         store.connection.close()
         app.Store(path).connection.close()  # idempotent
 

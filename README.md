@@ -6,7 +6,7 @@
 
 ## 功能
 
-- 普通关键词、组合关键词，可单独暂停或启用；支持屏蔽词；关键词可选择只匹配标题，或匹配标题 + 摘要
+- 普通关键词、组合关键词，可单独暂停或启用（关键词只匹配标题）；支持屏蔽词（检查标题和摘要）
 - 每个 RSS 源可分别设置“全量推送”或“关键词推送”，也可分别设置版块筛选
 - 每位用户最多 10 个推送目标（私聊、群组、频道）
 - 每位用户的规则互相独立，RSS 源由所有用户共享
@@ -72,7 +72,6 @@ curl -fsSL https://raw.githubusercontent.com/Soulleslie/rss-tg-bot/main/scripts/
 | `FETCH_CONCURRENCY` | 4 | 同时读取的源数量 |
 | `DELIVERY_RETENTION_DAYS` | 180 | 推送历史保留天数；0 表示永久保留 |
 | `DISPLAY_TIMEZONE` | Asia/Shanghai | `/history`、`/feedstatus` 显示时间用的时区 |
-| `DEFAULT_MATCH_SCOPE` | title | 关键词默认匹配范围：`title` 只看标题，`all` 看标题 + 摘要。用户用 `/match` 自己选过后，以用户的选择为准 |
 
 修改 `.env` 推荐用 `rss-tg-bot config`，保存后会自动重启。如果直接编辑文件，改完要运行 `rss-tg-bot restart` 才会生效。
 
