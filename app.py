@@ -246,8 +246,6 @@ class Store:
             # survives restarts, so a crash between "seen" and "sent" no longer
             # silently drops the notification.
             "items": {"pending": "INTEGER NOT NULL DEFAULT 0"},
-            # Where keywords are looked for: 'all' = title + summary, 'title' = title only.
-            "users": {"match_scope": "TEXT NOT NULL DEFAULT 'all'"},
         }
         for table, columns in additions.items():
             existing = self._columns(table)
@@ -359,12 +357,7 @@ HELP_TOPICS: dict[str, tuple[str, str]] = {
 · <b>关键词只对“关键词推送”的源生效</b>。全量推送的源不看关键词，新文章都会推送
 · <b>屏蔽词对你订阅的所有源都生效</b>，包括全量推送的源
 · 关键词和屏蔽词都不能单独给某个源设置
-机器人检查文章的标题和摘要：不区分英文大小写，只要包含就算命中。
-
-<b>匹配范围</b>（默认看标题 + 摘要）
-{c("/match title")} — 关键词只看标题。正文里顺带提到的词（例如收购帖里的“有出的私聊”）不会触发推送
-{c("/match all")} — 改回看标题 + 摘要
-屏蔽词始终检查标题 + 摘要，不受这个设置影响。
+<b>关键词只看文章标题</b>，<b>屏蔽词检查标题和摘要</b>。都不区分英文大小写，只要包含就算命中。
 
 <b>普通关键词</b>：包含其中任意一个就推送
 {c("/keywords OpenAI,Claude")} — 添加两个关键词
@@ -378,7 +371,7 @@ HELP_TOPICS: dict[str, tuple[str, str]] = {
 {c("/kwon 3")} — 重新启用 3 号关键词
 {c("/delkw 3")} — 删除 3 号关键词
 
-<b>屏蔽词</b>：包含其中任意一个就不推送（全量推送也会被拦截）
+<b>屏蔽词</b>：标题或摘要包含其中任意一个就不推送（全量推送也会被拦截）
 {c("/block 求购,已出")} — 添加两个屏蔽词
 /blocks — 查看屏蔽词和编号
 {c("/delblock 2")} — 删除 2 号屏蔽词
@@ -442,7 +435,7 @@ RSS 里出现一篇新文章时，<b>同时满足</b>下面所有条件才会推
 2. 你没有暂停推送（/pause）
 3. 文章在你选的版块里（没设置版块筛选就不限）
 4. 文章的标题和摘要里没有你的屏蔽词
-5. 这个源是全量推送；或者是关键词推送，并且文章命中了你的某个关键词
+5. 这个源是全量推送；或者是关键词推送，并且文章<b>标题</b>命中了你的某个关键词
 
 满足后，会发到你所有的推送目标。
 
@@ -520,7 +513,6 @@ USER_COMMANDS = [
     ("all", "推送方式，例：/all 1 on 或 /all 1 off"),
     ("keywords", "查看或添加关键词，例：/keywords OpenAI,Claude"),
     ("combo", "添加组合关键词，例：/combo dmit,corona"),
-    ("match", "关键词匹配范围：/match title 只看标题"),
     ("kwoff", "暂停关键词，例：/kwoff 3"),
     ("kwon", "启用关键词，例：/kwon 3"),
     ("delkw", "删除关键词，例：/delkw 3"),
@@ -1037,8 +1029,7 @@ async def keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     first = rows[0]["id"]
     await respond(
         update,
-        f"<b>我的关键词</b>（每行开头的数字是关键词ID）\n对你所有“关键词推送”的源生效。"
-        f"匹配范围：{MATCH_LABELS[match_scope(user_id)]}（/match 修改）\n\n{body}\n\n"
+        f"<b>我的关键词</b>（每行开头的数字是关键词ID）\n对你所有“关键词推送”的源生效。\n\n{body}\n\n"
         f"暂停：{c(f'/kwoff {first}')}　启用：{c(f'/kwon {first}')}　删除：{c(f'/delkw {first}')}\n"
         "（把数字换成要操作的关键词ID）" + full_push_note(user_id),
     )
@@ -1116,45 +1107,6 @@ async def delkw(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     store.execute("DELETE FROM rules WHERE id=?", (rule_id,))
     store.commit()
     await respond(update, f"已删除 {rule_id} 号关键词：{e(display_rule(rule['kind'], rule['value']))}")
-
-
-MATCH_SCOPES = {
-    "title": "title", "标题": "title", "只看标题": "title",
-    "all": "all", "全部": "all", "标题和摘要": "all", "摘要": "all",
-}
-MATCH_LABELS = {"title": "只看标题", "all": "标题 + 摘要"}
-
-
-def match_scope(user_id: int) -> str:
-    row = store.execute("SELECT match_scope FROM users WHERE user_id=?", (user_id,)).fetchone()
-    return row["match_scope"] if row and row["match_scope"] in MATCH_LABELS else "all"
-
-
-async def match(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await guard(update):
-        return
-    user_id = update.effective_user.id
-    choice = MATCH_SCOPES.get(command_text(context).casefold())
-    if choice is None:
-        current = match_scope(user_id)
-        await respond(
-            update,
-            f"<b>关键词匹配范围</b>：{MATCH_LABELS[current]}\n\n"
-            f"{c('/match title')} — 只看标题。正文里顺带提到的词不会触发推送\n"
-            f"{c('/match all')} — 看标题 + 摘要（默认）。能匹配到更多，但也更容易误命中\n\n"
-            "只影响关键词；屏蔽词始终检查标题 + 摘要。",
-        )
-        return
-    store.execute("UPDATE users SET match_scope=? WHERE user_id=?", (choice, user_id))
-    store.commit()
-    if choice == "title":
-        message = (
-            "✅ 关键词改为<b>只看标题</b>：只有标题包含关键词的文章才会推送。\n"
-            f"屏蔽词仍然检查标题 + 摘要。改回：{c('/match all')}"
-        )
-    else:
-        message = f"✅ 关键词改为看<b>标题 + 摘要</b>（默认）。只看标题：{c('/match title')}"
-    await respond(update, message)
 
 
 async def block(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1522,7 +1474,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append("<b>订阅的源</b>：无")
     lines += [
         "",
-        f"关键词：{rule_active} 个启用中（共 {rule_total} 个），匹配范围：{MATCH_LABELS[match_scope(user_id)]}",
+        f"关键词：{rule_active} 个启用中（共 {rule_total} 个）",
         f"屏蔽词：{block_total} 个",
         f"推送目标：{target_total} 个（最多 {MAX_TARGETS} 个）",
         f"检查 RSS 的间隔：{POLL_INTERVAL} 秒",
@@ -1853,7 +1805,7 @@ async def deliver_item(app: Application, item) -> None:
         row["target_id"] for row in store.execute("SELECT target_id FROM deliveries WHERE item_id=? AND status='sent'", (item_id,))
     }
     subscriptions = store.execute(
-        "SELECT s.user_id, u.paused, u.match_scope, COALESCE(p.active, 0) full_push FROM subscriptions s "
+        "SELECT s.user_id, u.paused, COALESCE(p.active, 0) full_push FROM subscriptions s "
         "JOIN users u ON u.user_id=s.user_id "
         "LEFT JOIN full_pushes p ON p.user_id=s.user_id AND p.feed_id=s.feed_id WHERE s.feed_id=?",
         (feed_id,),
@@ -1868,8 +1820,10 @@ async def deliver_item(app: Application, item) -> None:
             continue
         if is_blocked(user_id, searchable):
             continue
-        keyword_text = title if subscription["match_scope"] == "title" else searchable
-        matches = ["全量推送"] if subscription["full_push"] else matched_rules(user_id, keyword_text)
+        # Keywords look at the title only, so words mentioned in passing in the body
+        # (e.g. "有出的私聊" in a buying post) do not trigger a push.  Blocked words
+        # still check title + summary.
+        matches = ["全量推送"] if subscription["full_push"] else matched_rules(user_id, title)
         if not matches:
             continue
         matched = "；".join(matches)
@@ -2033,7 +1987,7 @@ async def post_shutdown(app: Application) -> None:
 COMMAND_HANDLERS = {
     "start": start, "help": help_command, "whoami": whoami, "feeds": feeds,
     "addfeed": addfeed, "delfeed": delfeed, "subscribe": subscribe, "unsubscribe": unsubscribe,
-    "mysources": my_sources, "all": all_posts, "keywords": keywords, "combo": combo, "match": match,
+    "mysources": my_sources, "all": all_posts, "keywords": keywords, "combo": combo,
     "kwon": kwon, "kwoff": kwoff, "on": kwon, "off": kwoff,
     "delkw": delkw, "block": block, "blocks": blocks, "delblock": delblock,
     "sections": sections, "clearsections": clear_sections, "addtarget": addtarget,
