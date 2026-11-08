@@ -23,6 +23,7 @@ os.environ.update(
         "POLL_INTERVAL_SECONDS": "60",
         "FETCH_TIMEOUT_SECONDS": "20",
         "DELIVERY_RETENTION_DAYS": "180",
+        "DEFAULT_MATCH_SCOPE": "title",
         "TG_BOT_TOKEN": "",
         "no_proxy": "127.0.0.1,localhost",
         "NO_PROXY": "127.0.0.1,localhost",
