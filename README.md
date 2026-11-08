@@ -72,6 +72,7 @@ curl -fsSL https://raw.githubusercontent.com/Soulleslie/rss-tg-bot/main/scripts/
 | `FETCH_CONCURRENCY` | 4 | 同时读取的源数量 |
 | `DELIVERY_RETENTION_DAYS` | 180 | 推送历史保留天数；0 表示永久保留 |
 | `DISPLAY_TIMEZONE` | Asia/Shanghai | `/history`、`/feedstatus` 显示时间用的时区 |
+| `DEFAULT_MATCH_SCOPE` | title | 关键词默认匹配范围：`title` 只看标题，`all` 看标题 + 摘要。用户用 `/match` 自己选过后，以用户的选择为准 |
 
 修改 `.env` 推荐用 `rss-tg-bot config`，保存后会自动重启。如果直接编辑文件，改完要运行 `rss-tg-bot restart` 才会生效。
 

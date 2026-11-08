@@ -78,6 +78,11 @@ FETCH_TIMEOUT = env_int("FETCH_TIMEOUT_SECONDS", 20, 5)
 FETCH_CONCURRENCY = env_int("FETCH_CONCURRENCY", 4, 1)
 DELIVERY_RETENTION_DAYS = env_int("DELIVERY_RETENTION_DAYS", 180, 0)
 DISPLAY_TZ_NAME = os.getenv("DISPLAY_TIMEZONE", "").strip() or "Asia/Shanghai"
+# Where keywords are looked for unless a user picked otherwise with /match.
+MATCH_LABELS = {"title": "只看标题", "all": "标题 + 摘要"}
+DEFAULT_MATCH_SCOPE = os.getenv("DEFAULT_MATCH_SCOPE", "").strip().lower() or "title"
+if DEFAULT_MATCH_SCOPE not in MATCH_LABELS:
+    raise SystemExit(f".env 中的 DEFAULT_MATCH_SCOPE 只能是 title 或 all，当前值：{DEFAULT_MATCH_SCOPE!r}")
 DISPLAY_TZ = load_timezone(DISPLAY_TZ_NAME)
 DB_PATH = Path(os.getenv("DB_PATH", "").strip() or ROOT / "rss_tg_bot.db")
 ALLOWED_USER_IDS = parse_ids("ALLOWED_USER_IDS")
@@ -247,7 +252,8 @@ class Store:
             # silently drops the notification.
             "items": {"pending": "INTEGER NOT NULL DEFAULT 0"},
             # Where keywords are looked for: 'all' = title + summary, 'title' = title only.
-            "users": {"match_scope": "TEXT NOT NULL DEFAULT 'all'"},
+            # match_scope_set=0 means the user never chose, so DEFAULT_MATCH_SCOPE applies.
+            "users": {"match_scope": "TEXT NOT NULL DEFAULT 'all'", "match_scope_set": "INTEGER NOT NULL DEFAULT 0"},
         }
         for table, columns in additions.items():
             existing = self._columns(table)
@@ -361,9 +367,9 @@ HELP_TOPICS: dict[str, tuple[str, str]] = {
 · 关键词和屏蔽词都不能单独给某个源设置
 机器人检查文章的标题和摘要：不区分英文大小写，只要包含就算命中。
 
-<b>匹配范围</b>（默认看标题 + 摘要）
+<b>匹配范围</b>（默认：{MATCH_LABELS[DEFAULT_MATCH_SCOPE]}）
 {c("/match title")} — 关键词只看标题。正文里顺带提到的词（例如收购帖里的“有出的私聊”）不会触发推送
-{c("/match all")} — 改回看标题 + 摘要
+{c("/match all")} — 看标题 + 摘要，能匹配到更多，但也更容易误命中
 屏蔽词始终检查标题 + 摘要，不受这个设置影响。
 
 <b>普通关键词</b>：包含其中任意一个就推送
@@ -1038,7 +1044,7 @@ async def keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await respond(
         update,
         f"<b>我的关键词</b>（每行开头的数字是关键词ID）\n对你所有“关键词推送”的源生效。"
-        f"匹配范围：{MATCH_LABELS[match_scope(user_id)]}（/match 修改）\n\n{body}\n\n"
+        f"匹配范围：{scope_label(match_scope(user_id))}（/match 修改）\n\n{body}\n\n"
         f"暂停：{c(f'/kwoff {first}')}　启用：{c(f'/kwon {first}')}　删除：{c(f'/delkw {first}')}\n"
         "（把数字换成要操作的关键词ID）" + full_push_note(user_id),
     )
@@ -1122,12 +1128,17 @@ MATCH_SCOPES = {
     "title": "title", "标题": "title", "只看标题": "title",
     "all": "all", "全部": "all", "标题和摘要": "all", "摘要": "all",
 }
-MATCH_LABELS = {"title": "只看标题", "all": "标题 + 摘要"}
+def effective_scope(stored: str | None, chosen: int | None) -> str:
+    return stored if chosen and stored in MATCH_LABELS else DEFAULT_MATCH_SCOPE
 
 
 def match_scope(user_id: int) -> str:
-    row = store.execute("SELECT match_scope FROM users WHERE user_id=?", (user_id,)).fetchone()
-    return row["match_scope"] if row and row["match_scope"] in MATCH_LABELS else "all"
+    row = store.execute("SELECT match_scope, match_scope_set FROM users WHERE user_id=?", (user_id,)).fetchone()
+    return effective_scope(row["match_scope"], row["match_scope_set"]) if row else DEFAULT_MATCH_SCOPE
+
+
+def scope_label(scope: str) -> str:
+    return MATCH_LABELS[scope] + ("（默认）" if scope == DEFAULT_MATCH_SCOPE else "")
 
 
 async def match(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1139,13 +1150,13 @@ async def match(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         current = match_scope(user_id)
         await respond(
             update,
-            f"<b>关键词匹配范围</b>：{MATCH_LABELS[current]}\n\n"
-            f"{c('/match title')} — 只看标题。正文里顺带提到的词不会触发推送\n"
-            f"{c('/match all')} — 看标题 + 摘要（默认）。能匹配到更多，但也更容易误命中\n\n"
+            f"<b>关键词匹配范围</b>：{scope_label(current)}\n\n"
+            f"{c('/match title')} — {scope_label('title')}。正文里顺带提到的词不会触发推送\n"
+            f"{c('/match all')} — 看{scope_label('all')}。能匹配到更多，但也更容易误命中\n\n"
             "只影响关键词；屏蔽词始终检查标题 + 摘要。",
         )
         return
-    store.execute("UPDATE users SET match_scope=? WHERE user_id=?", (choice, user_id))
+    store.execute("UPDATE users SET match_scope=?, match_scope_set=1 WHERE user_id=?", (choice, user_id))
     store.commit()
     if choice == "title":
         message = (
@@ -1153,7 +1164,7 @@ async def match(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"屏蔽词仍然检查标题 + 摘要。改回：{c('/match all')}"
         )
     else:
-        message = f"✅ 关键词改为看<b>标题 + 摘要</b>（默认）。只看标题：{c('/match title')}"
+        message = f"✅ 关键词改为看<b>标题 + 摘要</b>。只看标题：{c('/match title')}"
     await respond(update, message)
 
 
@@ -1522,7 +1533,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append("<b>订阅的源</b>：无")
     lines += [
         "",
-        f"关键词：{rule_active} 个启用中（共 {rule_total} 个），匹配范围：{MATCH_LABELS[match_scope(user_id)]}",
+        f"关键词：{rule_active} 个启用中（共 {rule_total} 个），匹配范围：{scope_label(match_scope(user_id))}",
         f"屏蔽词：{block_total} 个",
         f"推送目标：{target_total} 个（最多 {MAX_TARGETS} 个）",
         f"检查 RSS 的间隔：{POLL_INTERVAL} 秒",
@@ -1853,7 +1864,7 @@ async def deliver_item(app: Application, item) -> None:
         row["target_id"] for row in store.execute("SELECT target_id FROM deliveries WHERE item_id=? AND status='sent'", (item_id,))
     }
     subscriptions = store.execute(
-        "SELECT s.user_id, u.paused, u.match_scope, COALESCE(p.active, 0) full_push FROM subscriptions s "
+        "SELECT s.user_id, u.paused, u.match_scope, u.match_scope_set, COALESCE(p.active, 0) full_push FROM subscriptions s "
         "JOIN users u ON u.user_id=s.user_id "
         "LEFT JOIN full_pushes p ON p.user_id=s.user_id AND p.feed_id=s.feed_id WHERE s.feed_id=?",
         (feed_id,),
@@ -1868,7 +1879,8 @@ async def deliver_item(app: Application, item) -> None:
             continue
         if is_blocked(user_id, searchable):
             continue
-        keyword_text = title if subscription["match_scope"] == "title" else searchable
+        scope = effective_scope(subscription["match_scope"], subscription["match_scope_set"])
+        keyword_text = title if scope == "title" else searchable
         matches = ["全量推送"] if subscription["full_push"] else matched_rules(user_id, keyword_text)
         if not matches:
             continue
