@@ -12,6 +12,7 @@ import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlparse
 
 TMP = tempfile.mkdtemp(prefix="rss-tg-bot-test-")
 os.environ.update(
@@ -90,6 +91,7 @@ class FakeBot:
 
     def __init__(self):
         self.sent: list[tuple[str, str]] = []
+        self.sent_kwargs: list[dict] = []
         self.fail: dict[str, list[Exception]] = {}
         self.members: dict[tuple[str, int], SimpleNamespace] = {}
         self.chats: dict[str, SimpleNamespace] = {}
@@ -99,6 +101,7 @@ class FakeBot:
         if errors:
             raise errors.pop(0)
         self.sent.append((str(chat_id), text))
+        self.sent_kwargs.append(kwargs)
 
     async def get_chat_member(self, chat_id, user_id):
         member = self.members.get((str(chat_id), user_id))
@@ -153,6 +156,7 @@ def reset_db():
         app.store.execute("DELETE FROM sqlite_sequence WHERE name=?", (table,))
     app.store.commit()
     BOT.sent.clear()
+    BOT.sent_kwargs.clear()
     BOT.fail.clear()
     BOT.members.clear()
     BOT.chats.clear()
@@ -210,6 +214,40 @@ class HelperTests(unittest.TestCase):
             '<a href="https://x.com/?a=1&amp;b=&quot;2&quot;"><b>&lt;b&gt;A&amp;B&lt;/b&gt;</b></a>',
         )
         self.assertEqual(app.push_card("T"), "<b>T</b>")
+
+    def test_entry_author_reads_atom_profiles(self):
+        for metadata in (
+            '<author><name>A &amp; B</name><uri>https://example.com/profile?a=1&amp;b=2</uri></author>',
+            '<author><name>A &amp; B</name></author>'
+            '<link rel="author" href="https://example.com/profile?a=1&amp;b=2"/>',
+        ):
+            with self.subTest(metadata=metadata):
+                parsed_feed = app.feedparser.parse(
+                    '<feed xmlns="http://www.w3.org/2005/Atom"><title>Feed</title>'
+                    '<entry><id>1</id><title>News</title><link href="https://example.com/post/1"/>'
+                    + metadata + '</entry></feed>'
+                )
+                self.assertEqual(app.entry_author(parsed_feed.entries[0]), ("A & B", "https://example.com/profile?a=1&b=2"))
+
+    def test_entry_author_does_not_guess_profiles_on_other_sites(self):
+        for link in (
+            "https://example.com/post-1-1",
+            "https://www.nodeseek.com.example.com/post-1-1",
+            "https://www.nodeseek.com@example.com/post-1-1",
+            "https://[invalid",
+        ):
+            with self.subTest(link=link):
+                self.assertEqual(app.entry_author({"author": "alice", "link": link}), ("alice", ""))
+
+    def test_entry_author_ignores_invalid_profile_urls(self):
+        for href in (
+            "javascript:alert(1)", "mailto:alice@example.com", "https://[invalid",
+            "https://name@example.com/profile", "https://example.com/a b", None,
+        ):
+            with self.subTest(href=href):
+                item = entry("1", "News")
+                item["author_detail"] = {"name": "alice", "href": href}
+                self.assertEqual(app.entry_author(item), ("alice", ""))
 
     def test_help_pages_are_valid_telegram_html(self):
         for key in ["home", *app.HELP_TOPICS]:
@@ -288,6 +326,47 @@ class DeliveryTests(unittest.TestCase):
         poll(self.feed_id, [entry("a", "OpenAI news"), entry("b", "OpenAI again")])
         self.assertEqual(len(BOT.sent), 1)
         self.assertIn("OpenAI again", BOT.sent[0][1])
+        self.assertIsNone(BOT.sent_kwargs[0]["reply_markup"])
+
+    def test_nodeseek_author_button_survives_restart_and_retry(self):
+        call(app.all_posts, user_id=10, args=[str(self.feed_id), "on"])
+        app.store.execute("INSERT INTO targets(user_id, chat_id, title, created_at) VALUES(10, '-100', 'G', 'now')")
+        app.store.commit()
+        poll(self.feed_id, [entry("base", "baseline")])
+        app.process_feed(feed_row(self.feed_id), app.feedparser.parse(NODESEEK_RSS))
+        self.assertEqual(BOT.sent, [])
+
+        # Reopen the persisted database before delivering, as after a restart.
+        original_store = app.store
+        restored_store = app.Store(app.DB_PATH)
+        try:
+            app.store = restored_store
+            BOT.fail["10"] = [RetryAfter(0)]
+            run(app.deliver_pending(APP))
+            run(app.deliver_pending(APP))
+            saved_item = app.store.execute("SELECT * FROM items WHERE item_key='42'").fetchone()
+            self.assertEqual((saved_item["pending"], saved_item["summary"]), (0, None))
+            self.assertEqual(saved_item["author_name"], "新来的+A&B/#?")
+        finally:
+            app.store = original_store
+            restored_store.connection.close()
+
+        self.assertCountEqual([chat for chat, _ in BOT.sent], ["10", "-100"])
+        self.assertEqual(len(BOT.sent_kwargs), len(BOT.sent))
+        self.assertEqual(BOT.fail["10"], [])
+        for (_, text), options in zip(BOT.sent, BOT.sent_kwargs):
+            self.assertEqual(text, '<a href="https://www.nodeseek.com/post-42-1"><b>NodeSeek &amp; Telegram</b></a>')
+            assert_telegram_html(text)
+            self.assertFalse(options["link_preview_options"].is_disabled)
+            keyboard = options["reply_markup"].inline_keyboard
+            self.assertEqual([len(row) for row in keyboard], [1])
+            button = keyboard[0][0]
+            self.assertEqual(button.text, "@新来的+A&B/#?")
+            self.assertIsNone(button.callback_data)
+            profile = urlparse(button.url)
+            self.assertEqual((profile.scheme, profile.netloc, profile.path), ("https", "www.nodeseek.com", "/member"))
+            self.assertEqual(parse_qs(profile.query), {"t": ["新来的+A&B/#?"]})
+            self.assertEqual(button.url, saved_item["author_url"])
 
     def test_empty_first_response_does_not_initialize(self):
         app.process_feed(feed_row(self.feed_id), Parsed(parsed([])))
@@ -837,6 +916,14 @@ RSS = b"""<?xml version="1.0"?><rss version="2.0"><channel><title>Local</title>
 <item><guid>1</guid><title>Hello</title><link>http://x/1</link><category>tech</category></item>
 </channel></rss>"""
 
+NODESEEK_RSS = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/">
+<channel><title>NodeSeek</title><link>https://www.nodeseek.com</link>
+<item><guid isPermaLink="false">42</guid><title><![CDATA[NodeSeek & Telegram]]></title>
+<link>https://www.nodeseek.com/post-42-1</link><description>RSS source</description>
+<dc:creator><![CDATA[新来的+A&B/#?]]></dc:creator></item>
+</channel></rss>"""
+
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -927,8 +1014,11 @@ class MigrationTests(unittest.TestCase):
         store = app.Store(path)
         self.assertIn("etag", store._columns("feeds"))
         self.assertIn("pending", store._columns("items"))
+        self.assertIn("author_name", store._columns("items"))
+        self.assertIn("author_url", store._columns("items"))
         item = store.execute("SELECT * FROM items").fetchone()
         self.assertEqual((item["title"], item["pending"], item["summary"]), ("T", 0, None))
+        self.assertEqual((item["author_name"], item["author_url"]), (None, None))
         self.assertEqual(store.execute("SELECT initialized FROM feeds").fetchone()["initialized"], 1)
         store.connection.close()
         app.Store(path).connection.close()  # idempotent

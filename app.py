@@ -13,7 +13,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import feedparser
@@ -245,7 +245,7 @@ class Store:
             # pending=1: a new article that has not finished delivery yet.  It
             # survives restarts, so a crash between "seen" and "sent" no longer
             # silently drops the notification.
-            "items": {"pending": "INTEGER NOT NULL DEFAULT 0"},
+            "items": {"pending": "INTEGER NOT NULL DEFAULT 0", "author_name": "TEXT", "author_url": "TEXT"},
         }
         for table, columns in additions.items():
             existing = self._columns(table)
@@ -1736,7 +1736,9 @@ def retry_seconds(value) -> float:
     return value.total_seconds() if isinstance(value, timedelta) else float(value)
 
 
-async def send_with_retry(app: Application, target, text: str) -> None:
+async def send_with_retry(
+    app: Application, target, text: str, reply_markup: InlineKeyboardMarkup | None = None
+) -> None:
     """Send one notification, waiting out flood limits and short network errors."""
     chat_id = target["chat_id"]
     attempt = 0
@@ -1748,6 +1750,7 @@ async def send_with_retry(app: Application, target, text: str) -> None:
                 text=text,
                 parse_mode=ParseMode.HTML,
                 link_preview_options=LinkPreviewOptions(is_disabled=False),
+                reply_markup=reply_markup,
             )
             return
         except RetryAfter as error:
@@ -1811,6 +1814,9 @@ async def deliver_item(app: Application, item) -> None:
         (feed_id,),
     ).fetchall()
     message = push_card(title, link)
+    author_url = item["author_url"] or ""
+    author_label = f"@{item['author_name']}" if item["author_name"] else "作者主页"
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(author_label, url=author_url)]]) if author_url else None
     for subscription in subscriptions:
         user_id = subscription["user_id"]
         if subscription["paused"]:
@@ -1831,7 +1837,7 @@ async def deliver_item(app: Application, item) -> None:
             if target["id"] in already_sent:
                 continue
             try:
-                await send_with_retry(app, target, message)
+                await send_with_retry(app, target, message, reply_markup=keyboard)
                 record_delivery(user_id, item_id, target["id"], matched, "sent", None)
             except Exception as error:
                 log.warning("Delivery to %s failed: %s", target["chat_id"], error)
@@ -1846,6 +1852,35 @@ def entry_categories(entry) -> list[str]:
         if name and name not in names:
             names.append(name)
     return names
+
+
+def entry_author(entry) -> tuple[str, str]:
+    """Read the author's name and profile, including NodeSeek's username redirect."""
+    authors = [entry.get("author_detail") or {}, *(entry.get("authors") or [])]
+    name = next(
+        (author["name"].strip() for author in authors if (author.get("name") or "").strip()),
+        (entry.get("author") or "").strip(),
+    )
+    candidates = [(author.get("name") or name, author.get("href")) for author in authors]
+    candidates.extend((name, link.get("href")) for link in entry.get("links", []) if link.get("rel") == "author")
+    for author_name, candidate in candidates:
+        candidate = (candidate or "").strip()
+        if not candidate or any(char.isspace() for char in candidate):
+            continue
+        try:
+            url = urlparse(candidate)
+            if url.scheme in {"http", "https"} and url.hostname and not (url.username or url.password):
+                return author_name.strip(), candidate
+        except ValueError:
+            continue
+
+    try:
+        post = urlparse(entry.get("link") or "")
+        if name and post.scheme in {"http", "https"} and post.hostname in {"nodeseek.com", "www.nodeseek.com"}:
+            return name, "https://www.nodeseek.com/member?" + urlencode({"t": name})
+    except ValueError:
+        pass
+    return name, ""
 
 
 def process_feed(feed, parsed) -> int:
@@ -1867,9 +1902,11 @@ def process_feed(feed, parsed) -> int:
         if store.execute("SELECT 1 FROM items WHERE feed_id=? AND item_key=?", (feed_id, item_key)).fetchone():
             continue
         summary = clean_text(entry.get("summary", entry.get("description", "")) or "") if initialized else None
+        author_name, author_url = entry_author(entry)
         store.execute(
-            "INSERT INTO items(feed_id,item_key,title,link,summary,categories,first_seen,pending) VALUES(?,?,?,?,?,?,?,?)",
-            (feed_id, item_key, title, link, summary, "\n".join(categories), now(), int(initialized)),
+            "INSERT INTO items(feed_id,item_key,title,link,summary,categories,first_seen,pending,author_name,author_url) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (feed_id, item_key, title, link, summary, "\n".join(categories), now(), int(initialized), author_name, author_url),
         )
         queued += int(initialized)
     # Only mark the baseline as built once articles were actually read, so a
